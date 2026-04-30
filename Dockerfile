@@ -22,13 +22,19 @@
 # compatible with any HailoRT version installed on the host.
 # ============================================================
 
-FROM python:3.13-slim-bookworm
+
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim-bookworm
 
 # ── Python dependencies ──────────────────────────────────────────────────────
 # torch          — CPU decoder
 # openai-whisper — mel spectrogram + decoder (encoder runs on NPU)
 # wyoming        — Wyoming STT protocol
 # numpy          — mel preprocessing and NPU buffer I/O
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libusb-1.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir \
         torch \
         openai-whisper \

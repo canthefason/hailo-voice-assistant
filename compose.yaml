@@ -148,15 +148,15 @@ services:
     volumes:
       # Hailo Python bindings — mounted from host to avoid redistributing
       # Hailo's proprietary wheel inside the image.
-      - /usr/lib/python3/dist-packages/hailo_platform:/usr/lib/python3/dist-packages/hailo_platform:ro
+      # Path depends on which Python pip used: check with find /usr -name "_pyhailort*.so"
+      - /usr/local/lib/python3.13/dist-packages/hailo_platform:/usr/lib/python3/dist-packages/hailo_platform:ro
       # Native HailoRT library that the Python bindings link against.
       # Adjust the version suffix if you upgrade HailoRT on the host.
+      # Check your version: ls /usr/lib/libhailort.so.*
       - /usr/lib/libhailort.so.5.3.0:/usr/lib/libhailort.so.5.3.0:ro
       # Soname symlink — _pyhailort.so links against libhailort.so.5 (the soname),
       # not the versioned filename. Without this the dynamic linker can't resolve it.
-      - /usr/lib/libhailort.so.5:/usr/lib/libhailort.so.5:ro
-      # USB transport library required by libhailort.
-      - /usr/lib/aarch64-linux-gnu/libusb-1.0.so.0:/usr/lib/aarch64-linux-gnu/libusb-1.0.so.0:ro
+      - /usr/lib/libhailort.so:/usr/lib/libhailort.so:ro
     ports:
       - "10300:10300"
     restart: unless-stopped
