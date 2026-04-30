@@ -15,16 +15,28 @@
 #
 # hailo_platform is NOT installed in this image.
 # It is bind-mounted from the Pi host at runtime (see compose.yaml):
-#   /usr/lib/python3/dist-packages/hailo_platform  — Python bindings
-#   /usr/lib/libhailort.so.5.x.x                   — native library
-#   /usr/lib/aarch64-linux-gnu/libusb-1.0.so.0     — USB transport
+#   /usr/local/lib/python3.x/dist-packages/hailo_platform  — Python bindings
+#   /usr/lib/libhailort.so.5.x.x                           — native library
 # This keeps the image free of Hailo's proprietary binaries and makes it
 # compatible with any HailoRT version installed on the host.
+#
+# PYTHON_VERSION must match the version hailo_platform was compiled for on
+# the host Pi. Check with:
+#   ls /usr/local/lib/python3.*/dist-packages/hailo_platform/pyhailort/
+# The .so filename contains the version (e.g. cpython-313 → set to "3.13").
+# Standard Raspberry Pi OS Bookworm ships Python 3.11.
 # ============================================================
 
-FROM python:3.13-slim-bookworm
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim-bookworm
 
-# ── Python dependencies ──────────────────────────────────────────────────────
+# libusb-1.0-0: USB transport required by libhailort.
+# Installed from apt (Bookworm-native) rather than bind-mounted from the Pi
+# because the Pi's libusb may require a newer glibc than the container has.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libusb-1.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
 # torch          — CPU decoder
 # openai-whisper — mel spectrogram + decoder (encoder runs on NPU)
 # wyoming        — Wyoming STT protocol
@@ -57,7 +69,7 @@ EXPOSE 10300
 # Persist WHISPER_MODEL as an env var so the shell-form CMD can expand it.
 ENV WHISPER_MODEL=${WHISPER_MODEL}
 
-# Shell form used so $WHISPER_MODEL is expanded at container start.
+# Shell form so $WHISPER_MODEL is expanded at container start.
 CMD python3 -m wyoming_hailo_whisper \
         --hef      /opt/whisper/encoder.hef \
         --uri      tcp://0.0.0.0:10300 \
