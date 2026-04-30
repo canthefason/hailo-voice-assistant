@@ -57,7 +57,6 @@ EXPOSE 10300
 # Persist WHISPER_MODEL as an env var so the shell-form CMD can expand it.
 ENV WHISPER_MODEL=${WHISPER_MODEL}
 
-ENTRYPOINT ["python3", "-m", "wyoming_hailo_whisper"]
 # Shell form used so $WHISPER_MODEL is expanded at container start.
 CMD python3 -m wyoming_hailo_whisper \
         --hef      /opt/whisper/encoder.hef \
