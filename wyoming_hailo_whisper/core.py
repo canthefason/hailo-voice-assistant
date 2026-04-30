@@ -81,7 +81,10 @@ class HailoWhisperCore:
         # can still share the same physical device concurrently.
         _LOGGER.info("Opening Hailo VDevice (persistent)...")
         params = VDevice.create_params()
-        params.scheduling_algorithm = HailoSchedulingAlgorithm.NONE
+        # HailoRT 5.x InferModel API requires ROUND_ROBIN scheduling.
+        # NONE was valid with the 4.x streaming API but raises HAILO_INVALID_ARGUMENT
+        # when used with create_infer_model() / configure().
+        params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
 
         # ExitStack owns both context managers so close() releases them in order.
         self._exit_stack = contextlib.ExitStack()
