@@ -22,7 +22,7 @@
 # compatible with any HailoRT version installed on the host.
 # ============================================================
 
-FROM python:3.11-slim-bookworm
+FROM python:3.13-slim-bookworm
 
 # ── Python dependencies ──────────────────────────────────────────────────────
 # torch          — CPU decoder

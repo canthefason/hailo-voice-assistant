@@ -133,6 +133,8 @@ services:
       # hailo_platform lives in the host's system Python path, not the
       # container's pip path — expose it via PYTHONPATH.
       - PYTHONPATH=/usr/lib/python3/dist-packages
+      # Make the dynamic linker find the bind-mounted libhailort
+      - LD_LIBRARY_PATH=/usr/lib
     devices:
       - /dev/h1x-0:/dev/h1x-0
     volumes:
@@ -142,6 +144,9 @@ services:
       # Native HailoRT library that the Python bindings link against.
       # Adjust the version suffix if you upgrade HailoRT on the host.
       - /usr/lib/libhailort.so.5.3.0:/usr/lib/libhailort.so.5.3.0:ro
+      # Soname symlink — _pyhailort.so links against libhailort.so.5 (the soname),
+      # not the versioned filename. Without this the dynamic linker can't resolve it.
+      - /usr/lib/libhailort.so.5:/usr/lib/libhailort.so.5:ro
       # USB transport library required by libhailort.
       - /usr/lib/aarch64-linux-gnu/libusb-1.0.so.0:/usr/lib/aarch64-linux-gnu/libusb-1.0.so.0:ro
     ports:
