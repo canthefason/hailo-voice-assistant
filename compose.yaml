@@ -1,21 +1,29 @@
 services:
   hailo-ollama:
     container_name: hailo-ollama
-    image: hailo-ollama:5.3.0
+    image: canthefason/hailo-ollama:latest
     restart: unless-stopped
     ports:
       - "11434:11434"
     volumes:
+      # Model storage (read/write — populated by 02-install-hailo-ollama-npu.sh)
       - /usr/local/share/hailo-ollama:/usr/local/share/hailo-ollama
+      # hailo-ollama binary and HailoRT libs — bind-mounted from Pi host to avoid
+      # redistributing Hailo's proprietary binaries inside the image.
+      # Adjust the libhailort version suffix if you upgrade HailoRT on the host.
+      - /usr/local/bin/hailo-ollama:/usr/local/bin/hailo-ollama:ro
+      - /usr/lib/libhailort.so.5.3.0:/usr/lib/libhailort.so.5.3.0:ro
+      - /usr/lib/aarch64-linux-gnu/libusb-1.0.so.0:/usr/lib/aarch64-linux-gnu/libusb-1.0.so.0:ro
     devices:
       - /dev/h1x-0:/dev/h1x-0
     group_add:
       - "0"
     environment:
-      - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_KEEP_ALIVE=-1
       - HAILO_OLLAMA_VDEVICE_GROUP_ID=SHARED
       - XDG_DATA_HOME=/usr/local/share
+      # Make the dynamic linker find the bind-mounted libhailort
+      - LD_LIBRARY_PATH=/usr/lib
   homeassistant:
     container_name: homeassistant
     image: "ghcr.io/home-assistant/home-assistant:2026.4.4"

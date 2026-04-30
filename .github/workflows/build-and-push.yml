@@ -37,7 +37,7 @@
 #   Browse https://dev-public.hailo.ai/ to find the version that contains the
 #   HEF file for your model (Whisper-Small.hef, Whisper-Tiny.hef, Whisper-Base.hef).
 # ============================================================
-name: Build and Push hailo-whisper
+name: Build and Push
 
 on:
   push:
@@ -47,12 +47,14 @@ on:
     paths:
       - 'Dockerfile'
       - 'wyoming_hailo_whisper/**'
+      - 'hailo_ollama_proxy/**'
       - '.github/workflows/build-and-push.yml'
 
   pull_request:
     paths:
       - 'Dockerfile'
       - 'wyoming_hailo_whisper/**'
+      - 'hailo_ollama_proxy/**'
 
   workflow_dispatch:
     inputs:
@@ -71,6 +73,7 @@ on:
 
 env:
   IMAGE_NAME: ${{ vars.DOCKERHUB_IMAGE_NAME || 'canthefason/wyoming-hailo-whisper' }}
+  HAILO_OLLAMA_IMAGE: ${{ vars.DOCKERHUB_HAILO_OLLAMA_IMAGE || 'canthefason/hailo-ollama' }}
   HAILO_VERSION: '5.3.0'
   # Default model when not triggered by workflow_dispatch
   DEFAULT_MODEL: 'small.en'
@@ -237,6 +240,103 @@ jobs:
             echo "| Image  | \`${{ env.IMAGE_NAME }}:${{ steps.params.outputs.tag }}\` |"
             echo "| Model  | \`${{ steps.params.outputs.model }}\` |"
             echo "| HEF    | \`${{ steps.params.outputs.hef }}\` |"
+            echo "| Pushed | ${{ steps.params.outputs.push }} |"
+            echo "| Commit | \`${{ steps.params.outputs.short_sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # hailo-ollama — OpenAI-compatibility proxy image
+  # Much faster than wyoming-hailo-whisper: no QEMU-emulated model download,
+  # just apt + two small Python files.
+  # ══════════════════════════════════════════════════════════════════════════════
+  build-hailo-ollama:
+    name: Build hailo-ollama
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Determine build parameters ────────────────────────────────────────
+      - name: Determine build parameters
+        id: params
+        run: |
+          if [[ -n "${{ inputs.image_tag }}" ]]; then
+            TAG="${{ inputs.image_tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="$(git rev-parse --short HEAD)"
+          fi
+
+          PUSH=false
+          if [[ "${{ github.event_name }}" == "push" ]] && \
+             [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == refs/tags/* ]]; then
+            PUSH=true
+          fi
+          if [[ "${{ inputs.push_image }}" == "true" ]]; then
+            PUSH=true
+          fi
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            PUSH=false
+          fi
+
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "tag=${TAG}"               >> "$GITHUB_OUTPUT"
+          echo "push=${PUSH}"            >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}"  >> "$GITHUB_OUTPUT"
+
+          echo "──────────────────────────────────────"
+          echo "  Image : ${{ env.HAILO_OLLAMA_IMAGE }}:${TAG}"
+          echo "  Push  : ${PUSH}"
+          echo "──────────────────────────────────────"
+
+      # ── 3. QEMU + Buildx ─────────────────────────────────────────────────────
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 4. Docker Hub login ───────────────────────────────────────────────────
+      - name: Log in to Docker Hub
+        if: steps.params.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── 5. Build (and push) ───────────────────────────────────────────────────
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: hailo_ollama_proxy
+          platforms: linux/arm64
+          push: ${{ steps.params.outputs.push == 'true' }}
+          tags: |
+            ${{ env.HAILO_OLLAMA_IMAGE }}:${{ steps.params.outputs.tag }}
+            ${{ env.HAILO_OLLAMA_IMAGE }}:${{ steps.params.outputs.short_sha }}
+            ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && format('{0}:latest', env.HAILO_OLLAMA_IMAGE) || '' }}
+          cache-from: type=gha,scope=hailo-ollama
+          cache-to:   type=gha,scope=hailo-ollama,mode=max
+          provenance: false
+
+      # ── 6. Job summary ────────────────────────────────────────────────────────
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## hailo-ollama build"
+            echo ""
+            echo "| Field  | Value |"
+            echo "|--------|-------|"
+            echo "| Image  | \`${{ env.HAILO_OLLAMA_IMAGE }}:${{ steps.params.outputs.tag }}\` |"
             echo "| Pushed | ${{ steps.params.outputs.push }} |"
             echo "| Commit | \`${{ steps.params.outputs.short_sha }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

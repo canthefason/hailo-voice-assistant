@@ -46,8 +46,8 @@ GENAI_REPO_DIR="${GENAI_REPO_DIR:-/home/${RPI_USER}/hailo_model_zoo_genai}"
 HAILO_OLLAMA_BIN="/usr/local/bin/hailo-ollama"
 HAILO_OLLAMA_PORT=11434
 COMPOSE_FILE="${HA_DIR}/compose.yaml"
-DOCKER_BUILD_DIR="${DOCKER_BUILD_DIR:-/home/${RPI_USER}/hailo-ollama-docker}"
-IMAGE_TAG="hailo-ollama:${HAILO_VERSION}"
+HAILO_OLLAMA_IMAGE="${HAILO_OLLAMA_IMAGE:-canthefason/hailo-ollama}"
+IMAGE_TAG="${HAILO_OLLAMA_IMAGE}:latest"
 
 # Model to load on the Hailo-10H NPU.
 # Override via environment variable, e.g.:  HAILO_MODEL=qwen2.5:0.5b bash 02-install-hailo-ollama-npu.sh
@@ -254,369 +254,32 @@ fi
 ok "Port $HAILO_OLLAMA_PORT: free"
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 4 — Build a minimal Docker image for hailo-ollama
 # ═══════════════════════════════════════════════════════════════
-header "STEP 4 — Build Docker image: $IMAGE_TAG"
+# STEP 4 — Pull hailo-ollama image from Docker Hub
+# ═══════════════════════════════════════════════════════════════
+header "STEP 4 — Pull Docker image: $IMAGE_TAG"
 
+# The hailo-ollama Docker image is built by GitHub Actions and published to
+# Docker Hub. It contains only the OpenAI-compat proxy (our code).
+# The hailo-ollama binary and libhailort are bind-mounted from the Pi host
+# at runtime — they were built and installed in STEP 2 above.
 DOCKER_OUT=""; DOCKER_RC=0
 DOCKER_OUT=$(pi "
-  # Check before set -e so the login-shell EXIT trap doesn't fire on exit 0
-  if docker image inspect ${IMAGE_TAG} > /dev/null 2>&1; then
-    # Verify: no missing libs AND proxy.py is baked in
-    MISSING=\$(docker run --rm --entrypoint ldd ${IMAGE_TAG} /usr/local/bin/hailo-ollama 2>/dev/null | grep 'not found' || true)
-    HAS_PROXY=\$(docker run --rm --entrypoint test ${IMAGE_TAG} -f /usr/local/bin/hailo-ollama-proxy.py 2>/dev/null && echo yes || echo no)
-    # Verify entrypoint has the proxy exec line (not the old broken seq-based version)
-    HAS_GOOD_EP=\$(docker run --rm --entrypoint grep ${IMAGE_TAG} hailo-ollama-proxy /usr/local/bin/hailo-ollama-entrypoint.sh > /dev/null 2>&1 && echo yes || echo no)
-    # Verify python3 is installed (needed for the proxy)
-    HAS_PYTHON3=\$(docker run --rm --entrypoint which ${IMAGE_TAG} python3 > /dev/null 2>&1 && echo yes || echo no)
-    # Verify proxy has the chr(92)-based fix_json_control_chars (no literal backslashes)
-    HAS_NEW_PROXY=\$(docker run --rm --entrypoint grep ${IMAGE_TAG} 'chr(92)' /usr/local/bin/hailo-ollama-proxy.py > /dev/null 2>&1 && echo yes || echo no)
-    # Verify curl is installed (needed for model pull from inside container)
-    HAS_CURL=\$(docker run --rm --entrypoint which ${IMAGE_TAG} curl > /dev/null 2>&1 && echo yes || echo no)
-    # Verify proxy has sanitize_for_hailo (fixes HailoRT internal LF re-serialisation crash)
-    HAS_HAILO_SANITIZE=\$(docker run --rm --entrypoint grep ${IMAGE_TAG} 'hailo-sanitize-v1' /usr/local/bin/hailo-ollama-proxy.py > /dev/null 2>&1 && echo yes || echo no)
-    HAS_LATENCY_OPT=\$(docker run --rm --entrypoint grep ${IMAGE_TAG} 'hailo-latency-v4' /usr/local/bin/hailo-ollama-proxy.py > /dev/null 2>&1 && echo yes || echo no)
-    if [ -z \"\$MISSING\" ] && [ \"\$HAS_PROXY\" = 'yes' ] && [ \"\$HAS_GOOD_EP\" = 'yes' ] && [ \"\$HAS_PYTHON3\" = 'yes' ] && [ \"\$HAS_NEW_PROXY\" = 'yes' ] && [ \"\$HAS_CURL\" = 'yes' ] && [ \"\$HAS_HAILO_SANITIZE\" = 'yes' ] && [ \"\$HAS_LATENCY_OPT\" = 'yes' ]; then
-      echo '  Image ${IMAGE_TAG} is up-to-date (libs OK, proxy OK, entrypoint OK, python3 OK, curl OK, sanitize OK, latency OK) — skipping build.'
-      echo 'IMAGE_READY'
-      exit 0
-    else
-      echo \"  Rebuilding image (missing libs: '\$MISSING', proxy: \$HAS_PROXY, good entrypoint: \$HAS_GOOD_EP, python3: \$HAS_PYTHON3, new proxy: \$HAS_NEW_PROXY, curl: \$HAS_CURL, sanitize: \$HAS_HAILO_SANITIZE)...\"
-      docker rmi ${IMAGE_TAG} 2>/dev/null || true
-    fi
-  fi
-
   set -e
-
-  echo '  Setting up Docker build context at ${DOCKER_BUILD_DIR}...'
-  mkdir -p ${DOCKER_BUILD_DIR}
-
-  # Copy the already-built binary into the build context
-  cp ${HAILO_OLLAMA_BIN} ${DOCKER_BUILD_DIR}/hailo-ollama
-
-  # Find and copy libhailort.so — hailo-ollama needs it at runtime
-  LIBHAILORT=\$(ldconfig -p 2>/dev/null | grep 'libhailort.so.${HAILO_VERSION}' | awk '{print \$NF}' | head -1)
-  if [ -z \"\$LIBHAILORT\" ]; then
-    LIBHAILORT=\$(find /usr/lib /usr/local/lib -name 'libhailort.so.${HAILO_VERSION}' 2>/dev/null | head -1)
-  fi
-  [ -n \"\$LIBHAILORT\" ] || { echo 'ERROR: libhailort.so.${HAILO_VERSION} not found'; exit 1; }
-  echo \"  libhailort found: \$LIBHAILORT\"
-  cp \"\$LIBHAILORT\" ${DOCKER_BUILD_DIR}/libhailort.so.${HAILO_VERSION}
-
-  # Collect all other non-system .so deps of hailo-ollama that aren't in the
-  # standard debian:bookworm-slim image (i.e. not libc / libm / libpthread / ld).
-  echo '  Collecting additional shared library dependencies...'
-  mkdir -p ${DOCKER_BUILD_DIR}/extra-libs
-  ldd ${HAILO_OLLAMA_BIN} 2>/dev/null | awk '/=>/{print \$3}' | grep -v '^$' | while read LIB; do
-    BASENAME=\$(basename \"\$LIB\")
-    # Skip libhailort (already copied) and core glibc libs (always in slim)
-    case \"\$BASENAME\" in
-      libhailort*|libc.so*|libm.so*|libpthread*|libdl.so*|librt.so*|ld-linux*) continue ;;
-    esac
-    # Only copy libs not provided by apt packages we install
-    case \"\$BASENAME\" in
-      libssl*|libcrypto*|libstdc*|libgcc_s*) cp -n \"\$LIB\" ${DOCKER_BUILD_DIR}/extra-libs/ 2>/dev/null || true ;;
-    esac
-  done
-  echo '  Extra libs copied:'
-  ls -1 ${DOCKER_BUILD_DIR}/extra-libs/ 2>/dev/null || echo '  (none)'
-
-  # Write a Python proxy that adds GET /v1/models support.
-  # hailo-ollama only implements the native Ollama API (/api/tags etc.) and returns
-  # 404 for the OpenAI-compatible GET /v1/models that extended_openai_conversation
-  # requires during setup. The proxy listens on port 11434 (what HA talks to),
-  # translates /v1/models -> /api/tags, and forwards everything else to
-  # hailo-ollama on its internal port 11436.
-  cat > ${DOCKER_BUILD_DIR}/proxy.py << 'PROXYEOF'
-#!/usr/bin/env python3
-# Thin OpenAI-compatibility proxy in front of hailo-ollama.
-# All strings use single quotes to survive being embedded in a bash double-quoted string.
-import http.server, urllib.request, urllib.error, json, os, sys
-
-BACKEND_PORT = int(os.environ.get('HAILO_INTERNAL_PORT', '11436'))
-LISTEN_PORT  = int(os.environ.get('OLLAMA_PROXY_PORT',  '11434'))
-BACKEND = 'http://127.0.0.1:' + str(BACKEND_PORT)
-
-
-def fix_json_control_chars(body_bytes):
-    '''Escape literal control characters inside JSON string values.
-    hailo-ollama strictly rejects U+000A/U+000D inside JSON strings (RFC 7159).
-    HA system prompts contain multi-line text that arrives with literal newlines.
-    chr(92)=backslash and chr(34)=double-quote avoid literal versions of those
-    characters, which would be misprocessed by the enclosing bash double-quoted string.'''
-    try:
-        body_str = body_bytes.decode('utf-8')
-    except Exception:
-        return body_bytes
-    BS = chr(92)
-    DQ = chr(34)
-    result = []
-    in_string = False
-    skip_next = False
-    for ch in body_str:
-        if skip_next:
-            result.append(ch)
-            skip_next = False
-        elif ch == BS and in_string:
-            result.append(ch)
-            skip_next = True
-        elif ch == DQ:
-            in_string = not in_string
-            result.append(ch)
-        elif in_string and ch == '\n':
-            result.append(BS + 'n')
-        elif in_string and ch == '\r':
-            result.append(BS + 'r')
-        elif in_string and ch == '\t':
-            result.append(BS + 't')
-        elif in_string and ord(ch) < 0x20:
-            result.append(BS + 'u{:04x}'.format(ord(ch)))
-        else:
-            result.append(ch)
-    return ''.join(result).encode('utf-8')
-
-
-def sanitize_for_hailo(body_bytes):
-    '''hailo-sanitize-v1
-    HailoRT's prompt renderer re-serialises message content to JSON internally
-    without escaping newline characters, causing parse_error.101 at runtime.
-    Layer-1 fix (fix_json_control_chars) makes the HTTP body valid JSON, but
-    hailo-ollama then takes the decoded string values and re-encodes them to JSON
-    again without escaping, so any newlines in the *values* still crash it.
-    This function parses the (now-valid) JSON, replaces newlines/CR/TAB chars
-    inside messages[].content, prompt, and system fields with spaces, then
-    re-serialises — so hailo-ollama never sees control chars in string values.'''
-    try:
-        data = json.loads(body_bytes.decode('utf-8'))
-    except Exception:
-        return body_bytes
-
-    def clean(s):
-        if not isinstance(s, str):
-            return s
-        return s.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-
-    changed = False
-    for key in ('prompt', 'system'):
-        if key in data and isinstance(data[key], str):
-            data[key] = clean(data[key])
-            changed = True
-    for msg in data.get('messages', []):
-        if isinstance(msg, dict) and 'content' in msg:
-            msg['content'] = clean(msg['content'])
-            changed = True
-
-    if not changed:
-        return body_bytes
-    return json.dumps(data).encode('utf-8')
-
-
-def inject_defaults(body_bytes, path):
-    '''hailo-latency-v4
-    Inject conservative inference defaults to reduce latency for short
-    Home Assistant voice prompts. Only sets values the caller did not specify:
-      - max_tokens=120 for /v1/chat/completions  (limits output length)
-      - num_predict=60 for /api/generate|chat    (Ollama-native equivalent)
-      - num_ctx=512    for /api/generate|chat    (smaller KV cache = faster prefill)
-    max_tokens=120 for OpenAI endpoint: enough to fit a full tool_call JSON
-    (HassTurnOn with entity_id is ~50 tokens) plus a short spoken reply,
-    while capping runaway verbose responses. At ~14 tok/s this limits
-    worst-case generation to ~8s. num_predict=60 for native Ollama endpoint
-    (no function-call JSON overhead there).
-    512 ctx covers the HA system prompt + user turn with room to spare.
-    '''
-    try:
-        data = json.loads(body_bytes.decode('utf-8'))
-    except Exception:
-        return body_bytes
-
-    changed = False
-    p = path.split('?')[0].rstrip('/')
-
-    if p == '/v1/chat/completions':
-        # Always enforce a hard cap — HA sends max_tokens=1022 by default which
-        # at ~14 tok/s on Hailo-10H would allow up to 73s of generation.
-        # 120 tokens safely covers execute_services JSON (~50 tok) + spoken reply.
-        if data.get('max_tokens', 0) > 120:
-            data['max_tokens'] = 120
-            changed = True
-        elif 'max_tokens' not in data:
-            data['max_tokens'] = 120
-            changed = True
-    elif p in ('/api/generate', '/api/chat'):
-        opts = data.setdefault('options', {})
-        if 'num_predict' not in opts:
-            opts['num_predict'] = 60
-            changed = True
-        if 'num_ctx' not in opts:
-            opts['num_ctx'] = 512
-            changed = True
-
-    if not changed:
-        return body_bytes
-    return json.dumps(data).encode('utf-8')
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass  # suppress per-request noise; errors still go to stderr
-
-    # GET /v1/models -> convert /api/tags
-    def do_GET(self):
-        if self.path.rstrip('/') == '/v1/models':
-            try:
-                r = urllib.request.urlopen(BACKEND + '/api/tags', timeout=10)
-                data = json.loads(r.read())
-                models = [
-                    {'id': m['name'], 'object': 'model',
-                     'created': 0, 'owned_by': 'hailo'}
-                    for m in data.get('models', [])
-                ]
-                body = json.dumps({'object': 'list', 'data': models}).encode()
-                self._send(200, body, 'application/json')
-            except Exception as exc:
-                sys.stderr.write('[proxy] /v1/models error: ' + str(exc) + '\n')
-                body = json.dumps({'object': 'list', 'data': []}).encode()
-                self._send(200, body, 'application/json')
-        else:
-            self._forward()
-
-    def do_POST(self):   self._forward()
-    def do_DELETE(self): self._forward()
-    def do_PUT(self):    self._forward()
-    def do_HEAD(self):   self._forward()
-
-    # generic proxy
-    def _forward(self):
-        length = int(self.headers.get('Content-Length', 0))
-        body   = self.rfile.read(length) if length > 0 else None
-        # Layer 1: escape literal control chars so the HTTP body is valid JSON.
-        # Layer 2: replace newlines *inside decoded string values* so hailo-ollama's
-        # internal prompt renderer never re-serialises them into invalid JSON.
-        if body and self.headers.get('Content-Type', '').startswith('application/json'):
-            body = fix_json_control_chars(body)
-            body = sanitize_for_hailo(body)
-            body = inject_defaults(body, self.path)
-        req = urllib.request.Request(
-            BACKEND + self.path, data=body, method=self.command)
-        for k, v in self.headers.items():
-            if k.lower() not in ('host', 'content-length', 'transfer-encoding'):
-                req.add_header(k, v)
-        try:
-            r = urllib.request.urlopen(req, timeout=300)
-            resp_body = r.read()
-            self._send(r.status, resp_body,
-                       r.headers.get('Content-Type', 'application/octet-stream'))
-        except urllib.error.HTTPError as exc:
-            resp_body = exc.read()
-            self._send(exc.code, resp_body,
-                       exc.headers.get('Content-Type', 'application/json'))
-        except Exception as exc:
-            sys.stderr.write('[proxy] forward error: ' + str(exc) + '\n')
-            self._send(502, b'Bad Gateway', 'text/plain')
-
-    def _send(self, code, body, content_type):
-        self.send_response(code)
-        self.send_header('Content-Type', content_type)
-        self.send_header('Content-Length', len(body))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-if __name__ == '__main__':
-    sys.stderr.write('[proxy] listening on :' + str(LISTEN_PORT) + ' -> hailo-ollama:' + str(BACKEND_PORT) + '\n')
-    http.server.HTTPServer(('0.0.0.0', LISTEN_PORT), Handler).serve_forever()
-PROXYEOF
-
-  # Write entrypoint: create model dirs, start hailo-ollama on internal port 11436,
-  # then start the proxy on 11434 (the port HA talks to).
-  cat > ${DOCKER_BUILD_DIR}/entrypoint.sh << 'ENTRYEOF'
-#!/bin/bash
-mkdir -p /usr/local/share/hailo-ollama/models/manifests/hailo-ollama
-mkdir -p /usr/local/share/hailo-ollama/models/blob
-
-# Start hailo-ollama on internal port 11436
-OLLAMA_HOST=0.0.0.0:11436 /usr/local/bin/hailo-ollama serve &
-HAILO_PID=\$!
-
-# Wait up to 15s for hailo-ollama to be ready on its internal port
-for i in {1..15}; do
-    curl -sf http://127.0.0.1:11436/api/tags > /dev/null 2>&1 && break
-    sleep 1
-done
-
-# Start the OpenAI-compatibility proxy on port 11434 (foreground)
-exec python3 /usr/local/bin/hailo-ollama-proxy.py
-ENTRYEOF
-  chmod +x ${DOCKER_BUILD_DIR}/entrypoint.sh
-
-  # Write Dockerfile
-  # Use ubuntu:24.04 (glibc 2.39) — hailo-ollama is compiled on Pi OS Bookworm
-  # which ships glibc 2.38, newer than debian:bookworm-slim's 2.36.
-  cat > ${DOCKER_BUILD_DIR}/Dockerfile << 'EOF'
-FROM ubuntu:24.04
-
-# Runtime deps: libusb (hailort), libssl3 (hailo-ollama TLS), libstdc++ (C++ runtime),
-# python3 (OpenAI-compat proxy), curl (model pull from inside container)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libusb-1.0-0 \
-    libssl3 \
-    libstdc++6 \
-    python3 \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy hailo-ollama binary and the HailoRT shared library
-COPY hailo-ollama          /usr/local/bin/hailo-ollama
-COPY libhailort.so.${HAILO_VERSION} /usr/lib/aarch64-linux-gnu/libhailort.so.${HAILO_VERSION}
-
-# Copy any remaining libs that were not satisfiable via apt
-COPY extra-libs/ /usr/lib/aarch64-linux-gnu/
-
-RUN chmod +x /usr/local/bin/hailo-ollama && ldconfig
-
-# Verify no missing shared libs before shipping the image
-RUN ldd /usr/local/bin/hailo-ollama | grep -v 'not found' > /dev/null \
-    || (echo 'ERROR: hailo-ollama has unresolved shared libs:' \
-        && ldd /usr/local/bin/hailo-ollama && exit 1)
-
-EXPOSE 11434
-
-# hailo-ollama runs internally on 11436; the proxy listens on 11434
-ENV HAILO_INTERNAL_PORT=11436
-ENV OLLAMA_PROXY_PORT=11434
-ENV OLLAMA_HOST=0.0.0.0:11436
-ENV OLLAMA_KEEP_ALIVE=-1
-
-# Proxy script adds GET /v1/models (converts /api/tags to OpenAI format)
-COPY proxy.py      /usr/local/bin/hailo-ollama-proxy.py
-COPY entrypoint.sh /usr/local/bin/hailo-ollama-entrypoint.sh
-RUN chmod +x /usr/local/bin/hailo-ollama-entrypoint.sh
-
-VOLUME [\"/usr/local/share/hailo-ollama\"]
-
-ENTRYPOINT [\"/usr/local/bin/hailo-ollama-entrypoint.sh\"]
-EOF
-
-  echo '  Building Docker image ${IMAGE_TAG}...'
-  docker build -t ${IMAGE_TAG} ${DOCKER_BUILD_DIR} 2>&1 | tail -20
-
-  echo 'IMAGE_BUILT'
+  echo '  Pulling ${IMAGE_TAG}...'
+  docker pull ${IMAGE_TAG} 2>&1 | tail -5
+  echo 'IMAGE_READY'
 ") || DOCKER_RC=$?
 echo "$DOCKER_OUT"
-[[ $DOCKER_RC -eq 0 ]] || die "Docker image build failed (exit $DOCKER_RC) — see output above."
+[[ $DOCKER_RC -eq 0 ]] || die "docker pull failed (exit $DOCKER_RC) — see output above."
 
 if echo "$DOCKER_OUT" | grep -q "IMAGE_READY"; then
     IMAGE_STATUS="IMAGE_READY"
-    ok "Docker image: already exists, skipping build"
-elif echo "$DOCKER_OUT" | grep -q "IMAGE_BUILT"; then
-    IMAGE_STATUS="IMAGE_BUILT"
-    ok "Docker image $IMAGE_TAG: built"
+    ok "Docker image $IMAGE_TAG: pulled"
 else
-    die "Docker build completed but expected IMAGE_BUILT/IMAGE_READY token missing."
+    die "docker pull completed but IMAGE_READY token missing."
 fi
 
-# ═══════════════════════════════════════════════════════════════
 # STEP 5 — Update compose.yaml
 # ═══════════════════════════════════════════════════════════════
 header "STEP 5 — Update compose.yaml"
@@ -683,20 +346,22 @@ service_block = '''  hailo-ollama:
     image: {image}
     restart: unless-stopped
     ports:
-      - \"{port}:{port}\"
+      - "{port}:{port}"
     volumes:
       - /usr/local/share/hailo-ollama:/usr/local/share/hailo-ollama
+      - /usr/local/bin/hailo-ollama:/usr/local/bin/hailo-ollama:ro
+      - /usr/lib/libhailort.so.5.3.0:/usr/lib/libhailort.so.5.3.0:ro
+      - /usr/lib/aarch64-linux-gnu/libusb-1.0.so.0:/usr/lib/aarch64-linux-gnu/libusb-1.0.so.0:ro
     devices:
       - /dev/h1x-0:/dev/h1x-0
     group_add:
-      - \"{gid}\"
+      - "{gid}"
     environment:
-      - OLLAMA_HOST=0.0.0.0:{port}
       - OLLAMA_KEEP_ALIVE=-1
       - HAILO_OLLAMA_VDEVICE_GROUP_ID=SHARED
       - XDG_DATA_HOME=/usr/local/share
+      - LD_LIBRARY_PATH=/usr/lib
 '''.format(image=IMAGE_TAG, port=PORT, gid=HAILO_GID)
-
 # Remove any existing hailo-ollama block so we always apply the latest config
 lines = content.splitlines(keepends=True)
 new_lines = []
