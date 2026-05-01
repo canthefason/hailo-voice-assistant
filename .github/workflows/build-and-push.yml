@@ -120,7 +120,10 @@ jobs:
           elif [[ -n "${{ inputs.image_tag }}" ]]; then
             TAG="${{ inputs.image_tag }}"
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # Strip leading 'v' so the image tag matches the VERSION file
+            # e.g. git tag v1.0.1 → Docker image canthefason/wyoming-hailo-whisper:1.0.1
             TAG="${{ github.ref_name }}"
+            TAG="${TAG#v}"
           else
             TAG="$(git rev-parse --short HEAD)"
           fi
@@ -293,7 +296,10 @@ jobs:
           elif [[ -n "${{ inputs.image_tag }}" ]]; then
             TAG="${{ inputs.image_tag }}"
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # Strip leading 'v' so the image tag matches the VERSION file
+            # e.g. git tag v1.0.1 → Docker image canthefason/hailo-ollama:1.0.1
             TAG="${{ github.ref_name }}"
+            TAG="${TAG#v}"
           else
             TAG="$(git rev-parse --short HEAD)"
           fi
