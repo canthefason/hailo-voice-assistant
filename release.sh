@@ -90,11 +90,17 @@ fi
 # ═══════════════════════════════════════════════════════════════
 info "Extracting CHANGELOG.md entry for [${VERSION}]..."
 
-# Pull every line between "## [X.Y.Z]" and the next "## [" heading
+# Pull every line between "## [X.Y.Z]" and the next "## [" heading,
+# collapsing consecutive blank lines into one (works on BSD + GNU awk).
 RELEASE_NOTES=$(awk \
-    "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" \
-    "$CHANGELOG" \
-    | sed '/^[[:space:]]*$/{ /./!d }')   # collapse runs of blank lines
+    "/^## \[${VERSION}\]/{found=1; next}
+     found && /^## \[/{exit}
+     found{
+       if (/^[[:space:]]*$/) { blank++; next }
+       if (blank > 0) { print \"\"; blank=0 }
+       print
+     }" \
+    "$CHANGELOG")
 
 if [[ -z "$RELEASE_NOTES" ]]; then
     warn "No content found under '## [${VERSION}]' in CHANGELOG.md."
