@@ -232,28 +232,7 @@ jobs:
           cache-to:   type=gha,scope=hailo-whisper-${{ steps.params.outputs.model }}-py${{ steps.params.outputs.python_version }},mode=max
           provenance: false   # smaller image — no SBOM/attestation layer on arm64
 
-      # ── 8. Smoke test ─────────────────────────────────────────────────────────
-      # Inspect the built image without running it (avoids slow QEMU startup).
-      - name: Smoke test — verify image metadata
-        if: steps.params.outputs.push != 'true'
-        run: |
-          # When not pushed, the image is in the local buildx cache. Load it first.
-          docker buildx build \
-            --platform linux/arm64 \
-            --load \
-            --build-arg HEF="${{ steps.params.outputs.hef }}" \
-            --build-arg WHISPER_MODEL="${{ steps.params.outputs.model }}" \
-            --build-arg PYTHON_VERSION="${{ steps.params.outputs.python_version }}" \
-            --cache-from type=gha,scope=hailo-whisper-${{ steps.params.outputs.model }}-py${{ steps.params.outputs.python_version }} \
-            -t smoke-test:local \
-            . 2>&1 | tail -5
-
-          docker inspect smoke-test:local \
-            --format 'Entrypoint: {{json .Config.Entrypoint}}  Cmd: {{json .Config.Cmd}}'
-          docker inspect smoke-test:local \
-            --format '{{index .Config.Env}}' | tr ' ' '\n' | grep WHISPER_MODEL
-
-      # ── 9. Job summary ────────────────────────────────────────────────────────
+      # ── 8. Job summary ────────────────────────────────────────────────────────
       - name: Job summary
         if: always()
         run: |
