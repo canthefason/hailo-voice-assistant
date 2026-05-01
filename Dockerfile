@@ -1,37 +1,40 @@
 # ============================================================
 # Dockerfile — wyoming-hailo-whisper
-# Wyoming STT server: Whisper encoder on Hailo NPU, decoder on CPU.
+# Wyoming STT server: full speech-to-text pipeline on Hailo NPU via genai API.
 #
-# Build (automated via build-image.sh or GitHub Actions):
+# Build (automated via GitHub Actions):
 #   docker build \
 #     --build-arg HEF=whisper_small_en_encoder.hef \
-#     --build-arg WHISPER_MODEL=small.en \
 #     -t canthefason/wyoming-hailo-whisper:latest \
 #     .
 #
-# Override model at build time:
-#   --build-arg WHISPER_MODEL=tiny.en  --build-arg HEF=whisper_tiny_en_encoder.hef
-#   --build-arg WHISPER_MODEL=base.en  --build-arg HEF=whisper_base_en_encoder.hef
+# The Speech2Text genai API handles mel spectrogram + encoder + decoder
+# entirely on the Hailo-10H NPU — torch and openai-whisper are NOT needed.
 #
 # hailo_platform is NOT installed in this image.
 # It is bind-mounted from the Pi host at runtime (see compose.yaml):
-#   /usr/lib/python3/dist-packages/hailo_platform  — Python bindings
-#   /usr/lib/libhailort.so.5.x.x                   — native library
-#   /usr/lib/aarch64-linux-gnu/libusb-1.0.so.0     — USB transport
+#   /usr/local/lib/python3.x/dist-packages/hailo_platform  — Python bindings
+#   /usr/lib/libhailort.so.5.x.x                            — native library
+#   /usr/lib/libhailort.so.5                                — soname symlink
 # This keeps the image free of Hailo's proprietary binaries and makes it
 # compatible with any HailoRT version installed on the host.
 # ============================================================
 
-FROM python:3.13-slim-bookworm
+ARG PYTHON_VERSION=3.13
+FROM python:${PYTHON_VERSION}-slim-bookworm
+
+# ── System dependencies ──────────────────────────────────────────────────────
+# libusb-1.0-0: required by libhailort for USB transport to the NPU.
+# Installing from apt (not bind-mounting from Pi) avoids glibc version mismatch:
+# the Pi's libusb is compiled against glibc 2.38; Bookworm only ships glibc 2.36.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libusb-1.0-0 && \
+    rm -rf /var/lib/apt/lists/*
 
 # ── Python dependencies ──────────────────────────────────────────────────────
-# torch          — CPU decoder
-# openai-whisper — mel spectrogram + decoder (encoder runs on NPU)
-# wyoming        — Wyoming STT protocol
-# numpy          — mel preprocessing and NPU buffer I/O
+# wyoming  — Wyoming STT protocol
+# numpy    — audio buffer conversion (PCM-16 → float32)
 RUN pip install --no-cache-dir \
-        torch \
-        openai-whisper \
         wyoming \
         numpy
 
@@ -39,26 +42,19 @@ RUN pip install --no-cache-dir \
 COPY wyoming_hailo_whisper/ /app/wyoming_hailo_whisper/
 WORKDIR /app
 
-# ── Pre-download Whisper model weights ───────────────────────────────────────
-# Bake the decoder weights into the image so the first transcription
-# doesn't stall on a network download.
-# small.en ≈ 461 MB (better accuracy), tiny.en ≈ 75 MB (faster/smaller image)
-ARG WHISPER_MODEL=small.en
-RUN python3 -c "import whisper; whisper.load_model('${WHISPER_MODEL}')"
-
 # ── Hailo encoder HEF ────────────────────────────────────────────────────────
-# Compiled for the Hailo-10H NPU. Must match WHISPER_MODEL architecture.
+# Combined encoder+decoder HEF compiled for the Hailo-10H NPU.
+# Used by hailo_platform.genai.Speech2Text — not compatible with the old
+# low-level InferModel API.
 ARG HEF=whisper_small_en_encoder.hef
 COPY ${HEF} /opt/whisper/encoder.hef
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
 EXPOSE 10300
 
-# Persist WHISPER_MODEL as an env var so the shell-form CMD can expand it.
+ARG WHISPER_MODEL=small.en
 ENV WHISPER_MODEL=${WHISPER_MODEL}
 
-ENTRYPOINT ["python3", "-m", "wyoming_hailo_whisper"]
-# Shell form used so $WHISPER_MODEL is expanded at container start.
 CMD python3 -m wyoming_hailo_whisper \
         --hef      /opt/whisper/encoder.hef \
         --uri      tcp://0.0.0.0:10300 \
