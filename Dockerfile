@@ -15,7 +15,6 @@
 # It is bind-mounted from the Pi host at runtime (see compose.yaml):
 #   /usr/local/lib/python3.x/dist-packages/hailo_platform  — Python bindings
 #   /usr/lib/libhailort.so.5.x.x                            — native library
-#   /usr/lib/libhailort.so.5                                — soname symlink
 # This keeps the image free of Hailo's proprietary binaries and makes it
 # compatible with any HailoRT version installed on the host.
 #
@@ -36,6 +35,14 @@ FROM python:${PYTHON_VERSION}-slim-bookworm
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libusb-1.0-0 && \
     rm -rf /var/lib/apt/lists/*
+
+# ── Hailo soname symlink ─────────────────────────────────────────────────────
+# _pyhailort.so links against libhailort.so.5 (the soname), not the versioned
+# filename. Create the symlink at build time — it resolves correctly at runtime
+# once the versioned .so is bind-mounted from the Pi host. This eliminates the
+# need to bind-mount libhailort.so.5 separately in compose.yaml.
+ARG HAILORT_VERSION=5.3.0
+RUN ln -sf /usr/lib/libhailort.so.${HAILORT_VERSION} /usr/lib/libhailort.so.5
 
 # ── Python dependencies ──────────────────────────────────────────────────────
 # wyoming  — Wyoming STT protocol
