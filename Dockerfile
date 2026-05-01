@@ -18,6 +18,12 @@
 #   /usr/lib/libhailort.so.5                                — soname symlink
 # This keeps the image free of Hailo's proprietary binaries and makes it
 # compatible with any HailoRT version installed on the host.
+#
+# PYTHON_VERSION must match the version hailo_platform was compiled for on
+# the host Pi. Check with:
+#   ls /usr/local/lib/python3.*/dist-packages/hailo_platform/pyhailort/
+# The .so filename contains the version (e.g. cpython-313 → set to "3.13").
+# Standard Raspberry Pi OS Bookworm ships Python 3.11.
 # ============================================================
 
 ARG PYTHON_VERSION=3.13

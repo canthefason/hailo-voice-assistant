@@ -31,6 +31,10 @@
 #                          HEF files are fetched from:
 #                            https://dev-public.hailo.ai/v<WHISPER_VERSION>/blob/Whisper-<Size>.hef
 #                          e.g. set to "2.2.0" to fetch Whisper-Small.hef from v2.2.0
+#     PYTHON_VERSION       Python version matching what hailo_platform was compiled for
+#                          on the host Pi. Check with: ls /usr/lib/python3/dist-packages/hailo_platform/pyhailort/
+#                          The .so filename contains the version (e.g. cpython-313 → set to "3.13").
+#                          Defaults to "3.11" (standard Raspberry Pi OS Bookworm).
 #     DOCKERHUB_IMAGE_NAME Optional: override default image name (canthefason/wyoming-hailo-whisper)
 #
 # Finding the right WHISPER_VERSION:
@@ -41,7 +45,7 @@ name: Build and Push
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
     tags:
       - 'v*'
     paths:
@@ -70,6 +74,10 @@ on:
         description: 'Push image to Docker Hub'
         type: boolean
         default: true
+      python_version:
+        description: 'Python version matching host hailo_platform (e.g. 3.11, 3.12, 3.13)'
+        required: false
+        default: ''
 
 env:
   IMAGE_NAME: ${{ vars.DOCKERHUB_IMAGE_NAME || 'canthefason/wyoming-hailo-whisper' }}
@@ -77,6 +85,10 @@ env:
   HAILO_VERSION: '5.3.0'
   # Default model when not triggered by workflow_dispatch
   DEFAULT_MODEL: 'small.en'
+  # Default Python version — must match the version hailo_platform was compiled for
+  # on the host Pi. Override with PYTHON_VERSION repo variable or workflow_dispatch input.
+  # Standard Raspberry Pi OS Bookworm ships with 3.11; custom installs may differ.
+  DEFAULT_PYTHON_VERSION: '3.11'
 
 jobs:
   build:
@@ -98,8 +110,14 @@ jobs:
           # ── Model ──
           MODEL="${{ inputs.whisper_model || env.DEFAULT_MODEL }}"
 
+          # ── Python version ──
+          # Priority: workflow_dispatch input > repo variable > env default
+          PYTHON_VERSION="${{ inputs.python_version || vars.PYTHON_VERSION || env.DEFAULT_PYTHON_VERSION }}"
+
           # ── Image tag ──
-          if [[ -n "${{ inputs.image_tag }}" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TAG="pr-${{ github.event.pull_request.number }}"
+          elif [[ -n "${{ inputs.image_tag }}" ]]; then
             TAG="${{ inputs.image_tag }}"
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG="${{ github.ref_name }}"
@@ -131,16 +149,18 @@ jobs:
 
           SHORT_SHA=$(git rev-parse --short HEAD)
 
-          echo "model=${MODEL}"           >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}"               >> "$GITHUB_OUTPUT"
-          echo "hef=${HEF}"              >> "$GITHUB_OUTPUT"
-          echo "hef_title=${HEF_TITLE}"  >> "$GITHUB_OUTPUT"
-          echo "push=${PUSH}"            >> "$GITHUB_OUTPUT"
-          echo "short_sha=${SHORT_SHA}"  >> "$GITHUB_OUTPUT"
+          echo "model=${MODEL}"                   >> "$GITHUB_OUTPUT"
+          echo "python_version=${PYTHON_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"                       >> "$GITHUB_OUTPUT"
+          echo "hef=${HEF}"                       >> "$GITHUB_OUTPUT"
+          echo "hef_title=${HEF_TITLE}"           >> "$GITHUB_OUTPUT"
+          echo "push=${PUSH}"                     >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}"           >> "$GITHUB_OUTPUT"
 
           echo "──────────────────────────────────────"
           echo "  Image     : ${{ env.IMAGE_NAME }}:${TAG}"
           echo "  Model     : ${MODEL}"
+          echo "  Python    : ${PYTHON_VERSION}"
           echo "  HEF (local): ${HEF}"
           echo "  HEF (CDN) : ${HEF_TITLE}.hef"
           echo "  Push      : ${PUSH}"
@@ -202,10 +222,11 @@ jobs:
           build-args: |
             HEF=${{ steps.params.outputs.hef }}
             WHISPER_MODEL=${{ steps.params.outputs.model }}
+            PYTHON_VERSION=${{ steps.params.outputs.python_version }}
           # GitHub Actions layer cache — skips torch+whisper download on cache hit.
-          # Cache key includes the model name so tiny/small/base get separate caches.
-          cache-from: type=gha,scope=hailo-whisper-${{ steps.params.outputs.model }}
-          cache-to:   type=gha,scope=hailo-whisper-${{ steps.params.outputs.model }},mode=max
+          # Cache key includes model + python version so different combos get separate caches.
+          cache-from: type=gha,scope=hailo-whisper-${{ steps.params.outputs.model }}-py${{ steps.params.outputs.python_version }}
+          cache-to:   type=gha,scope=hailo-whisper-${{ steps.params.outputs.model }}-py${{ steps.params.outputs.python_version }},mode=max
           provenance: false   # smaller image — no SBOM/attestation layer on arm64
 
       # ── 8. Smoke test ─────────────────────────────────────────────────────────
@@ -219,7 +240,8 @@ jobs:
             --load \
             --build-arg HEF="${{ steps.params.outputs.hef }}" \
             --build-arg WHISPER_MODEL="${{ steps.params.outputs.model }}" \
-            --cache-from type=gha,scope=hailo-whisper-${{ steps.params.outputs.model }} \
+            --build-arg PYTHON_VERSION="${{ steps.params.outputs.python_version }}" \
+            --cache-from type=gha,scope=hailo-whisper-${{ steps.params.outputs.model }}-py${{ steps.params.outputs.python_version }} \
             -t smoke-test:local \
             . 2>&1 | tail -5
 
@@ -239,6 +261,7 @@ jobs:
             echo "|--------|-------|"
             echo "| Image  | \`${{ env.IMAGE_NAME }}:${{ steps.params.outputs.tag }}\` |"
             echo "| Model  | \`${{ steps.params.outputs.model }}\` |"
+            echo "| Python | \`${{ steps.params.outputs.python_version }}\` |"
             echo "| HEF    | \`${{ steps.params.outputs.hef }}\` |"
             echo "| Pushed | ${{ steps.params.outputs.push }} |"
             echo "| Commit | \`${{ steps.params.outputs.short_sha }}\` |"
@@ -265,7 +288,9 @@ jobs:
       - name: Determine build parameters
         id: params
         run: |
-          if [[ -n "${{ inputs.image_tag }}" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TAG="pr-${{ github.event.pull_request.number }}"
+          elif [[ -n "${{ inputs.image_tag }}" ]]; then
             TAG="${{ inputs.image_tag }}"
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG="${{ github.ref_name }}"
@@ -274,15 +299,14 @@ jobs:
           fi
 
           PUSH=false
-          if [[ "${{ github.event_name }}" == "push" ]] && \
-             [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == refs/tags/* ]]; then
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            PUSH=true
+          fi
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             PUSH=true
           fi
           if [[ "${{ inputs.push_image }}" == "true" ]]; then
             PUSH=true
-          fi
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            PUSH=false
           fi
 
           SHORT_SHA=$(git rev-parse --short HEAD)
