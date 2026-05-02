@@ -10,6 +10,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.3] — 2026-05-01
+
+### Added
+- `hailo_ollama_proxy`: tool call emulation layer (hailo-tools-v1)
+  - **Request side** (`inject_tool_prompt`): detects `tools[]` in the request, injects a strict single-line JSON output instruction and a concrete `execute_services` example into the system message, then strips `tools`/`tool_choice` before forwarding — hailo-ollama does not implement the OpenAI tool calling spec and would ignore or reject these fields
+  - **Response side** (`rewrite_tool_response`): parses the model's plain-text output and rewrites it into the OpenAI `tool_calls` format Home Assistant expects (`finish_reason: "tool_calls"`, `content: null`); handles `{name, arguments}` objects, bare `{list:[]}` arguments, `func({})` call notation, and markdown-fenced JSON; falls back to the original plain-text response if no tool call is detected
+
+---
+
 ## [1.0.2] — 2026-05-01
 
 ### Added
@@ -60,7 +69,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-[Unreleased]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/canthefason/hailo-voice-assistant/releases/tag/v1.0.0
