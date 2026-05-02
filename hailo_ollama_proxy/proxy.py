@@ -32,12 +32,23 @@ Latency optimisation — inject_defaults (marker: hailo-latency-v5):
     generation on the Hailo-10H NPU. Only injects values the caller omitted.
     All thresholds are configurable via CLI args (see --help).
 
+Tool call emulation — inject_tool_prompt / rewrite_tool_response (marker: hailo-tools-v1):
+    hailo-ollama does not implement the OpenAI tools/tool_choice parameters.
+    On the request side, inject_tool_prompt extracts the tool schemas, injects
+    a strict JSON output instruction into the system message, and removes
+    tools/tool_choice from the request body so hailo-ollama doesn't reject them.
+    On the response side, rewrite_tool_response parses the model's text output
+    and rewrites it into the OpenAI tool_calls format that Home Assistant expects,
+    handling bare JSON, {"name":…,"arguments":…} objects, func({…}) notation,
+    and markdown-fenced code blocks.
+
 CLI args override environment variables, which override built-in defaults.
 """
 import argparse
 import http.server
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -267,6 +278,159 @@ def inject_defaults(body_bytes, path):
     return json.dumps(data).encode('utf-8')
 
 
+def inject_tool_prompt(body_bytes):
+    """hailo-tools-v1 (request side)
+
+    hailo-ollama does not implement the OpenAI tools/tool_choice parameters.
+    This layer emulates tool calling via prompt engineering:
+      1. Extracts tool schemas from the request
+      2. Injects a strict JSON output instruction into the system message
+         (no literal newlines — sanitize_for_hailo runs after this)
+      3. Removes tools/tool_choice from the request body
+
+    Returns (transformed_body_bytes, had_tools: bool).
+    """
+    try:
+        data = json.loads(body_bytes.decode('utf-8'))
+    except Exception:
+        return body_bytes, False
+
+    tools = data.get('tools')
+    if not tools:
+        return body_bytes, False
+
+    # Compact description of all available tools
+    tool_desc = ' | '.join(
+        '{}: {}'.format(t['function']['name'], t['function'].get('description', ''))
+        for t in tools if 'function' in t
+    )
+
+    # Concrete example using the execute_services schema HA always sends.
+    # Single-line — sanitize_for_hailo will run next and collapse any \n to spaces.
+    example = (
+        '{"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_on", '
+        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 50}}'
+        ']}}'
+    )
+
+    instruction = (
+        ' TOOL CALL RULES: Respond with ONLY a JSON object — no markdown, no explanation, nothing else.'
+        ' Use this exact format: {"name": "<tool_name>", "arguments": <arguments object>}.'
+        ' Available tools: ' + tool_desc + '.'
+        ' Example: ' + example
+    )
+
+    # Append to the existing system message, or prepend a new one
+    messages = data.get('messages', [])
+    injected = False
+    for msg in messages:
+        if msg.get('role') == 'system':
+            msg['content'] = (msg.get('content') or '') + instruction
+            injected = True
+            break
+    if not injected:
+        messages.insert(0, {'role': 'system', 'content': instruction.strip()})
+        data['messages'] = messages
+
+    # Remove fields hailo-ollama does not understand
+    data.pop('tools', None)
+    data.pop('tool_choice', None)
+
+    return json.dumps(data).encode('utf-8'), True
+
+
+def _try_parse_tool_call(text):
+    """Extract (fn_name, arguments_dict) from model output, or return None.
+
+    Handles these patterns the model may produce:
+      {"name": "fn", "arguments": {...}}    ideal format matching our injection
+      {"list": [...]}                        bare execute_services arguments
+      fn_name({"list": [...]})               Python-style call notation
+      ```json\\n{...}\\n```                  markdown-wrapped JSON
+    """
+    text = text.strip()
+
+    # Strip markdown fences
+    if '```' in text:
+        text = re.sub(r'```[a-z]*\n?', '', text).strip()
+
+    # Pattern: func_name({...})
+    fn_match = re.match(r'^(\w+)\s*\((\{.+\})\)\s*$', text, re.DOTALL)
+    if fn_match:
+        try:
+            return fn_match.group(1), json.loads(fn_match.group(2))
+        except Exception:
+            pass
+
+    # Pattern: pure JSON object
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            # {"name": "...", "arguments": {...}}
+            if 'name' in parsed and 'arguments' in parsed:
+                return parsed['name'], parsed['arguments']
+            # {"list": [...]} — bare execute_services arguments
+            if 'list' in parsed:
+                return 'execute_services', parsed
+    except Exception:
+        pass
+
+    return None
+
+
+def rewrite_tool_response(body_bytes):
+    """hailo-tools-v1 (response side)
+
+    hailo-ollama returns the model output as plain text in message.content.
+    This layer parses that text, and if it looks like a tool call, rewrites
+    the response into the OpenAI tool_calls format that Home Assistant expects:
+      - message.content → null
+      - message.tool_calls → [{id, type, function: {name, arguments}}]
+      - finish_reason → "tool_calls"
+
+    If the content cannot be parsed as a tool call it is returned unchanged,
+    so HA gets the plain text reply as a fallback.
+    """
+    try:
+        resp = json.loads(body_bytes.decode('utf-8'))
+    except Exception:
+        return body_bytes
+
+    choices = resp.get('choices', [])
+    if not choices:
+        return body_bytes
+
+    choice = choices[0]
+    message = choice.get('message', {})
+
+    # Already a proper tool_calls response — nothing to do
+    if message.get('tool_calls'):
+        return body_bytes
+
+    content = message.get('content') or ''
+    result = _try_parse_tool_call(content)
+    if result is None:
+        return body_bytes
+
+    fn_name, arguments = result
+    choice['message'] = {
+        'role': 'assistant',
+        'content': None,
+        'tool_calls': [{
+            'id': 'call_0',
+            'type': 'function',
+            'function': {
+                'name': fn_name,
+                'arguments': json.dumps(arguments),
+            }
+        }]
+    }
+    choice['finish_reason'] = 'tool_calls'
+    resp['choices'] = [choice]
+    return json.dumps(resp).encode('utf-8')
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Suppress default per-request noise; debug logging is handled explicitly.
@@ -299,9 +463,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _forward(self):
         length = int(self.headers.get('Content-Length', 0))
         body   = self.rfile.read(length) if length > 0 else None
+        had_tools = False
         if body and self.headers.get('Content-Type', '').startswith('application/json'):
             body = fix_json_control_chars(body)
-            body = sanitize_for_hailo(body)
+            body, had_tools = inject_tool_prompt(body)  # extract tools before sanitize
+            body = sanitize_for_hailo(body)             # collapse newlines incl. injected text
             body = inject_defaults(body, self.path)
         _debug_log('REQ', self.command, self.path, body)
         req = urllib.request.Request(
@@ -312,6 +478,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             r = urllib.request.urlopen(req, timeout=300)
             resp_body = r.read()
+            if had_tools:
+                resp_body = rewrite_tool_response(resp_body)
             _debug_log('RES', r.status, self.path, resp_body)
             self._send(r.status, resp_body,
                        r.headers.get('Content-Type', 'application/octet-stream'))
