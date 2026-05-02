@@ -94,6 +94,15 @@ def _parse_args():
                         'info=startup only, '
                         'debug=log requests/responses (system prompt truncated to 200 chars), '
                         'trace=like debug but full bodies, no truncation.')
+    p.add_argument('--no-retry-on-rejection',
+                   dest='retry_on_rejection', action='store_false',
+                   help='Disable single retry on tool-call validation rejection. '
+                        'When enabled (default), if the model emits a JSON-shaped '
+                        'tool call that fails validation (empty list, hallucinated '
+                        'entity_id, …), the proxy resends the request once with '
+                        'temperature=0.7 to perturb sampling. Costs ~one extra '
+                        'inference (~10-15s) on failed first attempts only.')
+    p.set_defaults(retry_on_rejection=True)
     return p.parse_args()
 
 
@@ -881,22 +890,29 @@ def rewrite_tool_response(body_bytes, known_entities=None):
 
     `known_entities`: optional set of entity_ids HA exposed to the model
     (extracted from the request body); used to reject hallucinated ids.
+
+    Returns `(new_body, status)` where status ∈ {'tool_call', 'rejected',
+    'pass_through'}. Callers can use 'rejected' to decide whether to retry
+    the request — the model's first attempt produced a tool-call shape that
+    failed validation, and a single retry with perturbed sampling sometimes
+    recovers. 'pass_through' means plain prose; retry won't help.
+    'tool_call' means we emitted a valid tool_calls response.
     """
     try:
         resp = json.loads(body_bytes.decode('utf-8'))
     except Exception:
-        return body_bytes
+        return body_bytes, 'pass_through'
 
     choices = resp.get('choices', [])
     if not choices:
-        return body_bytes
+        return body_bytes, 'pass_through'
 
     choice = choices[0]
     message = choice.get('message', {})
 
     # Already a proper tool_calls response — nothing to do
     if message.get('tool_calls'):
-        return body_bytes
+        return body_bytes, 'tool_call'
 
     content = message.get('content') or ''
     result = _try_parse_tool_call(content)
@@ -918,7 +934,7 @@ def rewrite_tool_response(body_bytes, known_entities=None):
             }
             choice['finish_reason'] = 'tool_calls'
             resp['choices'] = [choice]
-            return json.dumps(resp).encode('utf-8')
+            return json.dumps(resp).encode('utf-8'), 'tool_call'
 
         sys.stderr.write(
             '[proxy] tool call validation failed for {}: {}\n'
@@ -933,9 +949,33 @@ def rewrite_tool_response(body_bytes, known_entities=None):
         message['content'] = ''
         choice['message'] = message
         resp['choices'] = [choice]
-        return json.dumps(resp).encode('utf-8')
+        return json.dumps(resp).encode('utf-8'), 'rejected'
 
-    return body_bytes
+    return body_bytes, 'pass_through'
+
+
+def perturb_for_retry(body_bytes, temperature=0.7, top_p=0.95):
+    """Bump sampling parameters on a previously-prepared request body.
+
+    Used when the first attempt produced a structurally-bad tool call (empty
+    list, hallucinated entity_id, …) and we want a second shot. Lifting
+    temperature from HA's typical 0.1 to ~0.7 perturbs sampling enough that
+    a deterministic-failure pattern (e.g. always emitting the same wrong
+    Zigbee-style entity_id) often resolves on retry. Both the OpenAI-style
+    top-level fields and the native Ollama `options` block are updated so
+    the bump applies regardless of which path hailo-ollama uses internally.
+    """
+    try:
+        data = json.loads(body_bytes.decode('utf-8'))
+    except Exception:
+        return body_bytes
+    data['temperature'] = temperature
+    data['top_p'] = top_p
+    opts = data.get('options')
+    if isinstance(opts, dict):
+        opts['temperature'] = temperature
+        opts['top_p'] = top_p
+    return json.dumps(data).encode('utf-8')
 
 
 # Sentence boundary: end-of-sentence punctuation followed by whitespace then
@@ -1021,6 +1061,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):    self._forward()
     def do_HEAD(self):   self._forward()
 
+    def _send_to_backend(self, body, label):
+        """POST `body` to hailo-ollama and return (status_code, headers, response_bytes).
+
+        Raises urllib.error.HTTPError or other Exception on transport failure.
+        Used twice when retry-on-rejection fires.
+        """
+        req = urllib.request.Request(
+            BACKEND + self.path, data=body, method=self.command)
+        for k, v in self.headers.items():
+            if k.lower() not in ('host', 'content-length', 'transfer-encoding'):
+                req.add_header(k, v)
+        _debug_log('REQ', '{} ({})'.format(self.command, label) if label else self.command,
+                   self.path, body)
+        r = urllib.request.urlopen(req, timeout=300)
+        return r.status, r.headers, r.read()
+
     def _forward(self):
         length = int(self.headers.get('Content-Length', 0))
         body   = self.rfile.read(length) if length > 0 else None
@@ -1036,22 +1092,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = sanitize_conversation_roles(body)         # fix null content / tool roles
             body = sanitize_for_hailo(body)                  # collapse newlines
             body = inject_defaults(body, self.path)
-        _debug_log('REQ', self.command, self.path, body)
-        req = urllib.request.Request(
-            BACKEND + self.path, data=body, method=self.command)
-        for k, v in self.headers.items():
-            if k.lower() not in ('host', 'content-length', 'transfer-encoding'):
-                req.add_header(k, v)
         try:
-            r = urllib.request.urlopen(req, timeout=300)
-            resp_body = r.read()
+            status, headers, resp_body = self._send_to_backend(body, label='')
+            content_type = headers.get('Content-Type', 'application/octet-stream')
+
             if tool_mode is True:
-                resp_body = rewrite_tool_response(resp_body, known_entities)
+                resp_body, rewrite_status = rewrite_tool_response(resp_body, known_entities)
+                # On rejection (validation failed → JSON blanked), take one more shot
+                # with bumped sampling. The first failure is often a deterministic
+                # mistake (e.g. always picking the same hallucinated entity_id) that
+                # higher-temperature sampling shakes loose. Single retry, no recursion.
+                if rewrite_status == 'rejected' and ARGS.retry_on_rejection:
+                    sys.stderr.write(
+                        '[proxy] retrying once with temperature=0.7 (first attempt rejected)\n'
+                    )
+                    retry_body = perturb_for_retry(body)
+                    try:
+                        _, _, retry_resp = self._send_to_backend(retry_body, label='retry')
+                        retry_resp, retry_status = rewrite_tool_response(retry_resp, known_entities)
+                        sys.stderr.write(
+                            '[proxy] retry status: {}\n'.format(retry_status)
+                        )
+                        # Use whatever the retry produced — even if also rejected,
+                        # the second blank is still better than the first's raw JSON.
+                        resp_body = retry_resp
+                    except Exception as exc:
+                        sys.stderr.write('[proxy] retry forward error: ' + str(exc) + '\n')
+                        # Keep the first-attempt rejected (blanked) body as fallback.
             elif tool_mode == 'followup':
                 resp_body = truncate_followup_response(resp_body)
-            _debug_log('RES', r.status, self.path, resp_body)
-            self._send(r.status, resp_body,
-                       r.headers.get('Content-Type', 'application/octet-stream'))
+
+            _debug_log('RES', status, self.path, resp_body)
+            self._send(status, resp_body, content_type)
         except urllib.error.HTTPError as exc:
             resp_body = exc.read()
             _debug_log('RES', exc.code, self.path, resp_body)
@@ -1073,7 +1145,7 @@ if __name__ == '__main__':
     sys.stderr.write(
         '[proxy] listening on :{listen} -> hailo-ollama:{backend} | '
         'max_tokens={mt} num_predict={np} num_ctx={nc}'
-        '{temp}{topp}{debug}\n'.format(
+        '{temp}{topp}{retry}{debug}\n'.format(
             listen=LISTEN_PORT,
             backend=BACKEND_PORT,
             mt=ARGS.max_tokens,
@@ -1081,6 +1153,7 @@ if __name__ == '__main__':
             nc=ARGS.num_ctx,
             temp=' temperature={}'.format(ARGS.temperature) if ARGS.temperature is not None else '',
             topp=' top_p={}'.format(ARGS.top_p) if ARGS.top_p is not None else '',
+            retry='' if ARGS.retry_on_rejection else ' retry-on-rejection=off',
             debug='' if ARGS.log_level == 'info' else ' log-level={}'.format(ARGS.log_level),
         )
     )

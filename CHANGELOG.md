@@ -8,6 +8,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `hailo_ollama_proxy`: single retry on tool-call validation rejection. When the model emits a JSON-shaped tool call that fails validation (empty list, hallucinated `entity_id`, missing `domain`/`service`), the proxy resends the same request once with `temperature=0.7` and `top_p=0.95` to perturb sampling. The first failure is often a deterministic mistake — qwen2.5:1.5b at the default `temperature=0.1` HA sends will keep picking the same wrong Zigbee-style id; a higher-temperature retry breaks the pattern. Costs ~one extra inference (~10-15s) on failed first attempts only; successful first attempts are unaffected.
+- `--no-retry-on-rejection` CLI flag (default: retry enabled). Use it to opt out if the latency hit on failures matters more than the accuracy gain.
+
+### Changed
+- `rewrite_tool_response` now returns `(body, status)` where `status ∈ {'tool_call', 'rejected', 'pass_through'}` so the request layer can decide whether to retry. No behaviour change when retry is disabled.
+
 ---
 
 ## [1.0.8] — 2026-05-02
