@@ -583,11 +583,17 @@ def _clean_entity_id(value):
 
 # Service names the model invents instead of HA's actual `light.turn_on` for
 # brightness commands. All of these mean "turn_on with brightness_pct".
-_BRIGHTNESS_SERVICE_ALIASES = {'set_brightness', 'set_brightness_pct', 'set_brightness_level'}
+_BRIGHTNESS_SERVICE_ALIASES = {
+    'set_brightness', 'set_brightness_pct', 'set_brightness_level',
+    'dim', 'brighten', 'darken',
+}
 
 # Keys the model uses for brightness-percent. HA only accepts `brightness_pct`
 # (0-100) on light.turn_on; `brightness` is 0-255 and the others are invented.
-_BRIGHTNESS_KEY_ALIASES = ('brightness', 'value', 'new_value', 'level', 'percent', 'pct')
+_BRIGHTNESS_KEY_ALIASES = (
+    'brightness', 'value', 'new_value', 'new_level',
+    'level', 'dim_level', 'percent', 'pct',
+)
 
 
 def _normalize_brightness(item):
@@ -634,20 +640,29 @@ def _normalize_brightness(item):
 
 
 def _coalesce_list_items(items):
-    """Merge / drop list entries to neutralise the "two-action" failure mode.
+    """Merge / drop list entries to neutralise the "multi-action" failure mode.
 
-    Observed model outputs for a single-device command often contain 2-3 list
-    items: a real action plus a self-cancelling or hallucinated extra action.
-    This pass:
-      1. Merges items with the same domain+entity_id (e.g. plain turn_on +
-         turn_on-with-brightness for the same light → one turn_on with the
-         brightness applied).
-      2. Drops a turn_off that follows a turn_on of the same entity in the
-         same call (common qwen pattern; would cancel itself out at HA).
+    Observed: for single-device commands the model often emits 2-3 list items —
+    one real action plus a bogus turn_off / dim of an unrelated real entity in
+    HA's exposed list (Guest Room Stand Light is a frequent victim). This pass:
+
+      1. Same-entity merge — combine plain `turn_on` and `turn_on`-with-
+         brightness for the same entity into a single well-formed call.
+      2. Cancelling-pair drop — `turn_off` of an entity that was just
+         `turn_on`'d in the same call is removed.
+      3. Cross-entity brightness rescue — if the first item lacks
+         `brightness_pct` and a later item on a different entity has one,
+         copy the value onto the first item before dropping the rest.
+      4. Multi-distinct-entity drop — when distinct entity_ids remain, keep
+         only the first item. The project scope is single-device commands;
+         distinct second entities have always been the bogus pattern in
+         observed traffic. (Loosen this rule if real multi-device usage
+         appears.)
     """
     if not isinstance(items, list):
         return items
 
+    # Step 1: merge same-entity items
     merged = []
     seen = {}  # (domain, entity_id) → index in merged
 
@@ -666,14 +681,13 @@ def _coalesce_list_items(items):
             prior_sd = prior.setdefault('service_data', {})
             for k, v in sd.items():
                 prior_sd.setdefault(k, v)
-            # turn_on with brightness wins over plain turn_on for the same entity
             if item.get('service') == 'turn_on' and 'brightness_pct' in sd:
                 prior['service'] = 'turn_on'
         else:
             seen[key] = len(merged)
             merged.append(item)
 
-    # Drop turn_off that follows turn_on of same entity (self-cancelling pair)
+    # Step 2: drop self-cancelling turn_off
     out = []
     on_targets = set()
     for item in merged:
@@ -683,9 +697,26 @@ def _coalesce_list_items(items):
             on_targets.add(key)
             out.append(item)
         elif item.get('service') == 'turn_off' and key in on_targets:
-            continue  # drop the cancelling turn_off
+            continue
         else:
             out.append(item)
+
+    # Step 3: cross-entity brightness rescue + multi-item drop
+    if len(out) > 1:
+        first = out[0]
+        if isinstance(first, dict):
+            first_sd = first.setdefault('service_data', {})
+            if 'brightness_pct' not in first_sd:
+                for later in out[1:]:
+                    if not isinstance(later, dict):
+                        continue
+                    later_sd = later.get('service_data') or {}
+                    bp = later_sd.get('brightness_pct')
+                    if isinstance(bp, (int, float)):
+                        first_sd['brightness_pct'] = bp
+                        break
+        out = [out[0]]
+
     return out
 
 

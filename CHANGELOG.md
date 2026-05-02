@@ -17,12 +17,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - One-action-per-list rule added — model was emitting `turn_on + turn_off` pairs that cancelled each other for some dim phrasings
 - Follow-up reply hint hardened: "EXACTLY ONE short sentence about ONLY the device the user asked about, do not invent details" — model was listing unrelated entities and fabricating brightness values in the spoken summary
 - Proxy-side normalisation of model output (qwen2.5:1.5b ignores rules even after the prompt is tightened):
-  - Service name aliases: `set_brightness`, `set_brightness_pct`, `set_brightness_level` → `turn_on`
-  - Argument-key aliases: `value`, `new_value`, `brightness`, `level`, `percent`, `pct` → `brightness_pct`
+  - Service name aliases: `set_brightness`, `set_brightness_pct`, `set_brightness_level`, `dim`, `brighten`, `darken` → `turn_on`
+  - Argument-key aliases: `value`, `new_value`, `new_level`, `brightness`, `level`, `dim_level`, `percent`, `pct` → `brightness_pct`
   - Item-level `brightness_pct` (sibling of `service_data`) is moved INTO `service_data` so HA actually applies it
   - Brightness values > 100 are rescaled from the 0-255 range to 0-100
   - List entries targeting the same `(domain, entity_id)` are merged so a plain `turn_on` plus a `turn_on`-with-brightness collapse into one well-formed call
   - A `turn_off` of an entity that was just `turn_on`'d in the same call is dropped (self-cancelling pair)
+  - Cross-entity brightness rescue: when the model puts the user-intended action on entity A and a brightness on entity B (e.g. accidentally targeting `light.0x...,Guest Room Stand Light`), the brightness is copied onto A and the second item is dropped — observed as the dominant failure mode for "dim/set/at N%" phrasings on qwen2.5:1.5b
+  - Multi-distinct-entity drop: when more than one distinct `entity_id` remains after coalesce, only the first item is kept. Project scope is single-device commands and the second entity has consistently been bogus in observed traffic
 - Follow-up reply truncated to the first sentence — kills the multi-paragraph hallucinated entity roll-call ("the main bedroom lights remained off, the table lights were turned off, …") that came after an otherwise correct opening sentence
 
 ### Fixed
