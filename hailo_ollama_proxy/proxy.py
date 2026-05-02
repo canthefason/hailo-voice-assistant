@@ -407,10 +407,16 @@ def inject_tool_prompt(body_bytes):
     if followup:
         # Tool already executed; ask for a one-sentence natural-language summary.
         # Skipping the example injection avoids the model parroting JSON back.
+        # The "only mention the device the user asked about" clause stops the
+        # model from listing every entity it saw in the system prompt
+        # (qwen2.5:1.5b otherwise hallucinates a status report on unrelated
+        # devices). "Do not invent details" stops fabricated brightness values.
         followup_hint = (
-            ' The previous tool call already executed. Reply in plain English'
-            ' with a single short sentence confirming what was done. Do not'
-            ' emit JSON.'
+            ' The previous tool call already executed. Reply with EXACTLY ONE'
+            ' short sentence confirming what was done to the specific device the'
+            ' user asked about. Do not mention any other devices. Do not invent'
+            ' details such as brightness values that were not in the tool call.'
+            ' Do not emit JSON.'
         )
         for msg in messages:
             if msg.get('role') == 'system':
@@ -424,13 +430,28 @@ def inject_tool_prompt(body_bytes):
         for t in tools if 'function' in t
     )
 
-    # Concrete examples using the execute_services schema HA always sends.
-    # Two examples help the model generalise: one for on/off, one for dimming.
+    # Concrete examples covering the phrasings qwen2.5:1.5b otherwise gets wrong:
+    #   - "set to N%" / "at N%" / "brighter" / "darker" — model invents
+    #     `set_brightness_pct`, `value`, `brightness` (no _pct), or omits the
+    #     brightness entirely. Mapping all of these to the same turn_on +
+    #     brightness_pct shape via examples corrects the pattern match.
     # Single-line — sanitize_for_hailo will run next and collapse any \n to spaces.
     example = (
         'dim to 30%: {"name": "execute_services", "arguments": {"list": ['
         '{"domain": "light", "service": "turn_on", '
         '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 30}}]}} '
+        'set to 50%: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_on", '
+        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 50}}]}} '
+        'lights at 70%: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_on", '
+        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 70}}]}} '
+        'make brighter: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_on", '
+        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 80}}]}} '
+        'make dimmer: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_on", '
+        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 20}}]}} '
         'turn on: {"name": "execute_services", "arguments": {"list": ['
         '{"domain": "light", "service": "turn_on", '
         '"service_data": {"entity_id": "light.office_lights"}}]}} '
@@ -442,10 +463,12 @@ def inject_tool_prompt(body_bytes):
     instruction = (
         ' TOOL CALL RULES: Respond with ONLY a JSON object — no markdown, no explanation, nothing else.'
         ' Use this exact format: {"name": "<tool_name>", "arguments": <arguments object>}.'
+        ' Output exactly ONE item in the "list" array per command, unless the user explicitly named multiple devices.'
         ' Put all fields for one service (entity_id, brightness_pct, etc) inside a SINGLE service_data object — never repeat the service_data key.'
         ' entity_id must be exactly the dotted id (e.g. "light.office_lights") with no friendly-name suffix.'
+        ' For brightness commands ("dim", "set to N%", "at N%", "brighter", "darker"): use service "turn_on" with "brightness_pct" (integer 0-100) inside service_data. NEVER use the keys "brightness" or "value", and NEVER use a service named "set_brightness_pct".'
         ' Available tools: ' + tool_desc + '.'
-        ' Example: ' + example
+        ' Examples: ' + example
     )
 
     # Append to the existing system message, or prepend a new one

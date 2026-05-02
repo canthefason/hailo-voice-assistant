@@ -13,6 +13,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added `turn off` as a third injected example — model was using `turn_on` for all commands including off requests
 - Tool injection on tool-result follow-up turns now skips the JSON-only example block and asks for a one-sentence natural-language confirmation instead. Previously the model parroted JSON back after every successful action, validation rejected it as `{"list":[{}]}`, and HA's TTS read the raw JSON aloud
 - System prompt rules tightened: explicit instructions against repeating `service_data` and against appending the friendly-name suffix to `entity_id`
+- Brightness commands: added explicit rule banning `brightness` (no `_pct`), `value`, and the invented service name `set_brightness_pct`; expanded examples to cover "set to N%", "at N%", "brighter", "darker" alongside "dim"
+- One-action-per-list rule added — model was emitting `turn_on + turn_off` pairs that cancelled each other for some dim phrasings
+- Follow-up reply hint hardened: "EXACTLY ONE short sentence about ONLY the device the user asked about, do not invent details" — model was listing unrelated entities and fabricating brightness values in the spoken summary
 
 ### Fixed
 - `hailo_ollama_proxy`: stray trailing `"` appended by the model to its JSON output (e.g. `{...}}"`) caused `json.loads` to fail and the tool call rewrite to fall through to plain text; `_fix_json` now strips leading/trailing quote characters before any parse attempt
