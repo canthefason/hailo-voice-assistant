@@ -35,6 +35,7 @@ Everything runs locally. No cloud APIs. No subscriptions.
 | `02-install-hailo-ollama-npu.sh` | Installs hailo-ollama with NPU support and proxy |
 | `03-upgrade-service.sh` | Upgrades running services in place |
 | `pull-compose.sh` | Pulls latest compose file to Pi |
+| `voice-test.sh` | Runs voice commands through HA and reports the spoken reply (smoke test) |
 | `wyoming_hailo_whisper/` | Wyoming protocol integration for hailo-whisper |
 
 ## Building the hailo-whisper Docker image
@@ -52,6 +53,29 @@ The `hailo-whisper` image is built for `linux/arm64` via GitHub Actions (`.githu
 The encoder HEF is downloaded automatically from the public Hailo CDN — no manual uploads needed.
 
 **The HailoRT wheel is never baked into the image.** `hailo_platform` and its native libraries are bind-mounted from the Pi host at runtime (see `compose.yaml`). This means the Docker image contains no Hailo proprietary binaries and can be published publicly.
+
+## Testing voice commands
+
+`voice-test.sh` sends a list of commands through HA's `Extended OpenAI Conversation` agent (the same path the Pi's voice satellite takes after wake word + STT) and prints the spoken reply for each. Useful for live-testing proxy or prompt changes against whatever image is currently deployed on the Pi.
+
+```bash
+export HOME_ASSISTANT="<HA long-lived access token>"
+
+bash voice-test.sh                       # default 8-command suite (lights on/off/dim/brighten)
+bash voice-test.sh "turn on the lights"  # single ad-hoc command
+bash voice-test.sh -f my-commands.txt    # one command per line; blank lines and # comments OK
+bash voice-test.sh --log                 # also dump proxy log markers from this run
+bash voice-test.sh --interval 30         # seconds between commands (default 45)
+```
+
+Each command prints `✔` (speech reply received), `⊘` (silent — proxy blanked a JSON-shaped or rejected reply; the action may or may not have run, use `--log` to see), or `✘` (HA error speech or HTTP/parse failure), plus the wall-clock duration.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `HOME_ASSISTANT` | _(required)_ | HA long-lived bearer token |
+| `HA_URL` | `http://rpi.local:8123` | Home Assistant base URL |
+| `HA_AGENT_ID` | `conversation.extended_openai_conversation` | conversation agent entity_id |
+| `PI_SSH` | `hailo-pi` | SSH alias used by `--log` to fetch proxy logs |
 
 ## Key Engineering Notes
 
