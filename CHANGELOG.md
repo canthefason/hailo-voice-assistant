@@ -10,6 +10,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.7] — 2026-05-01
+
+### Fixed
+- `hailo_ollama_proxy`: broken service calls no longer reach Home Assistant when the model generates structurally valid but empty tool arguments (e.g. `{"list": [{}]}`); proxy now validates that each `execute_services` list item has `domain`, `service`, and `service_data.entity_id` before rewriting to `tool_calls` format — invalid calls are logged and returned as plain text instead
+
+### Changed
+- Injected tool call example expanded from one (turn on) to two (turn on + dim to 30%) to give the model a better template for brightness commands
+
+---
+
 ## [1.0.6] — 2026-05-01
 
 ### Fixed
@@ -96,7 +106,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-[Unreleased]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.6...HEAD
+[Unreleased]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.7...HEAD
+[1.0.7]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.3...v1.0.4
