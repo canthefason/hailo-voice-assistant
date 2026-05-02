@@ -432,11 +432,14 @@ def _fix_json(text):
     """Best-effort repair of common LLM JSON output artifacts.
 
     - Strips markdown fences
+    - Strips stray leading/trailing quote characters (e.g. model wraps output in "...")
     - Removes trailing commas before ] or } (e.g. [1, 2,] or {"a":1,})
     - Appends missing closing brackets/braces for truncated output
     """
     if '```' in text:
         text = re.sub(r'```[a-z]*\n?', '', text).strip()
+    # Strip stray surrounding quotes the model sometimes adds
+    text = text.strip('"\'')
     # Remove trailing commas before closing brackets/braces
     text = re.sub(r',\s*([}\]])', r'\1', text)
     # Balance unmatched opening braces/brackets (handles token-limit truncation)
