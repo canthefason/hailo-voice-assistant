@@ -411,6 +411,8 @@ def inject_tool_prompt(body_bytes):
         # model from listing every entity it saw in the system prompt
         # (qwen2.5:1.5b otherwise hallucinates a status report on unrelated
         # devices). "Do not invent details" stops fabricated brightness values.
+        # Even with this prompt the model often runs on past sentence one —
+        # the response side truncates to the first sentence as a hard cap.
         followup_hint = (
             ' The previous tool call already executed. Reply with EXACTLY ONE'
             ' short sentence confirming what was done to the specific device the'
@@ -422,7 +424,10 @@ def inject_tool_prompt(body_bytes):
             if msg.get('role') == 'system':
                 msg['content'] = (msg.get('content') or '') + followup_hint
                 break
-        return json.dumps(data).encode('utf-8'), False
+        # had_tools=False so rewrite_tool_response is skipped, but we still
+        # signal via the second return slot that the response should be
+        # truncated. Caller treats False as "no tool rewrite" anyway.
+        return json.dumps(data).encode('utf-8'), 'followup'
 
     # Compact description of all available tools
     tool_desc = ' | '.join(
@@ -576,16 +581,141 @@ def _clean_entity_id(value):
     return m.group(1) if m else value
 
 
+# Service names the model invents instead of HA's actual `light.turn_on` for
+# brightness commands. All of these mean "turn_on with brightness_pct".
+_BRIGHTNESS_SERVICE_ALIASES = {'set_brightness', 'set_brightness_pct', 'set_brightness_level'}
+
+# Keys the model uses for brightness-percent. HA only accepts `brightness_pct`
+# (0-100) on light.turn_on; `brightness` is 0-255 and the others are invented.
+_BRIGHTNESS_KEY_ALIASES = ('brightness', 'value', 'new_value', 'level', 'percent', 'pct')
+
+
+def _normalize_brightness(item):
+    """Coerce variant brightness encodings into HA's canonical shape.
+
+    Repairs the common qwen2.5:1.5b output mistakes for dim/set/at-N% commands:
+      - service: "set_brightness" / "set_brightness_pct" → "turn_on"
+      - service_data keys: value / new_value / brightness / level / percent → brightness_pct
+      - brightness_pct emitted at item level (sibling of service_data) is
+        moved INTO service_data so HA actually applies it
+      - brightness > 100 (model treated it as 0-255) is rescaled to 0-100
+    """
+    if not isinstance(item, dict):
+        return item
+
+    # Promote misplaced item-level brightness keys into service_data
+    sd = item.get('service_data')
+    if not isinstance(sd, dict):
+        sd = {}
+        item['service_data'] = sd
+    for k in _BRIGHTNESS_KEY_ALIASES + ('brightness_pct',):
+        if k in item and k not in sd:
+            sd[k] = item.pop(k)
+
+    # Normalize service name
+    svc = item.get('service')
+    if svc in _BRIGHTNESS_SERVICE_ALIASES:
+        item['service'] = 'turn_on'
+
+    # Collapse alias keys onto brightness_pct
+    for k in _BRIGHTNESS_KEY_ALIASES:
+        if k in sd and 'brightness_pct' not in sd:
+            sd['brightness_pct'] = sd.pop(k)
+        elif k in sd:
+            sd.pop(k, None)
+
+    # If brightness_pct landed in 0-255 range (model output `brightness`),
+    # rescale to 0-100. Anything > 100 is treated as a 0-255 value.
+    bp = sd.get('brightness_pct')
+    if isinstance(bp, (int, float)) and bp > 100:
+        sd['brightness_pct'] = max(0, min(100, round(bp * 100 / 255)))
+
+    return item
+
+
+def _coalesce_list_items(items):
+    """Merge / drop list entries to neutralise the "two-action" failure mode.
+
+    Observed model outputs for a single-device command often contain 2-3 list
+    items: a real action plus a self-cancelling or hallucinated extra action.
+    This pass:
+      1. Merges items with the same domain+entity_id (e.g. plain turn_on +
+         turn_on-with-brightness for the same light → one turn_on with the
+         brightness applied).
+      2. Drops a turn_off that follows a turn_on of the same entity in the
+         same call (common qwen pattern; would cancel itself out at HA).
+    """
+    if not isinstance(items, list):
+        return items
+
+    merged = []
+    seen = {}  # (domain, entity_id) → index in merged
+
+    for item in items:
+        if not isinstance(item, dict):
+            merged.append(item)
+            continue
+        sd = item.get('service_data') or {}
+        key = (item.get('domain'), sd.get('entity_id'))
+        if key[1] is None:
+            merged.append(item)
+            continue
+
+        if key in seen:
+            prior = merged[seen[key]]
+            prior_sd = prior.setdefault('service_data', {})
+            for k, v in sd.items():
+                prior_sd.setdefault(k, v)
+            # turn_on with brightness wins over plain turn_on for the same entity
+            if item.get('service') == 'turn_on' and 'brightness_pct' in sd:
+                prior['service'] = 'turn_on'
+        else:
+            seen[key] = len(merged)
+            merged.append(item)
+
+    # Drop turn_off that follows turn_on of same entity (self-cancelling pair)
+    out = []
+    on_targets = set()
+    for item in merged:
+        sd = item.get('service_data') or {}
+        key = (item.get('domain'), sd.get('entity_id'))
+        if item.get('service') == 'turn_on' and key[1] is not None:
+            on_targets.add(key)
+            out.append(item)
+        elif item.get('service') == 'turn_off' and key in on_targets:
+            continue  # drop the cancelling turn_off
+        else:
+            out.append(item)
+    return out
+
+
 def _scrub_arguments(args):
-    """Walk execute_services arguments and clean entity_id fields in place."""
+    """Walk execute_services arguments and canonicalise entries in place.
+
+    Cleanups applied:
+      - entity_id stripped of `,Friendly Name` suffix
+      - service / arg names normalised (set_brightness → turn_on, value → brightness_pct …)
+      - misplaced item-level brightness_pct moved into service_data
+      - same-entity items merged; self-cancelling turn_off after turn_on dropped
+    """
     if not isinstance(args, dict):
         return args
-    for item in args.get('list', []) or []:
+    items = args.get('list')
+    if not isinstance(items, list):
+        return args
+
+    cleaned = []
+    for item in items:
         if not isinstance(item, dict):
+            cleaned.append(item)
             continue
+        item = _normalize_brightness(item)
         sd = item.get('service_data')
         if isinstance(sd, dict) and 'entity_id' in sd:
             sd['entity_id'] = _clean_entity_id(sd['entity_id'])
+        cleaned.append(item)
+
+    args['list'] = _coalesce_list_items(cleaned)
     return args
 
 
@@ -725,6 +855,47 @@ def rewrite_tool_response(body_bytes):
     return body_bytes
 
 
+# Sentence boundary: end-of-sentence punctuation followed by whitespace then
+# (typically) a capital letter or end of string. Conservative — won't split on
+# decimals or abbreviations because it requires a space + capital after.
+_SENTENCE_END_RE = re.compile(r'([.!?])\s+(?=[A-Z])')
+
+
+def truncate_followup_response(body_bytes):
+    """Cap the assistant reply at the first sentence on tool-result follow-up turns.
+
+    qwen2.5:1.5b reliably produces a correct opening sentence ("The office
+    lights were turned on at 70 percent brightness.") and then keeps writing,
+    listing every entity from the system prompt and inventing details about
+    each. Truncating after the first sentence keeps the accurate part and
+    drops the hallucinations.
+    """
+    try:
+        resp = json.loads(body_bytes.decode('utf-8'))
+    except Exception:
+        return body_bytes
+
+    choices = resp.get('choices', [])
+    if not choices:
+        return body_bytes
+    choice = choices[0]
+    message = choice.get('message', {})
+    content = message.get('content')
+    if not isinstance(content, str) or not content.strip():
+        return body_bytes
+
+    m = _SENTENCE_END_RE.search(content)
+    if m:
+        truncated = content[:m.end(1)].rstrip()
+        if truncated and truncated != content.strip():
+            message['content'] = truncated
+            choice['message'] = message
+            resp['choices'] = [choice]
+            return json.dumps(resp).encode('utf-8')
+
+    return body_bytes
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Suppress default per-request noise; debug logging is handled explicitly.
@@ -757,10 +928,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _forward(self):
         length = int(self.headers.get('Content-Length', 0))
         body   = self.rfile.read(length) if length > 0 else None
-        had_tools = False
+        tool_mode = False  # False | True | 'followup'
         if body and self.headers.get('Content-Type', '').startswith('application/json'):
             body = fix_json_control_chars(body)
-            body, had_tools = inject_tool_prompt(body)       # extract tools, inject prompt
+            body, tool_mode = inject_tool_prompt(body)       # extract tools, inject prompt
             body = sanitize_conversation_roles(body)         # fix null content / tool roles
             body = sanitize_for_hailo(body)                  # collapse newlines
             body = inject_defaults(body, self.path)
@@ -773,8 +944,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             r = urllib.request.urlopen(req, timeout=300)
             resp_body = r.read()
-            if had_tools:
+            if tool_mode is True:
                 resp_body = rewrite_tool_response(resp_body)
+            elif tool_mode == 'followup':
+                resp_body = truncate_followup_response(resp_body)
             _debug_log('RES', r.status, self.path, resp_body)
             self._send(r.status, resp_body,
                        r.headers.get('Content-Type', 'application/octet-stream'))
