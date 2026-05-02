@@ -42,6 +42,14 @@ Tool call emulation — inject_tool_prompt / rewrite_tool_response (marker: hail
     handling bare JSON, {"name":…,"arguments":…} objects, func({…}) notation,
     and markdown-fenced code blocks.
 
+Conversation role sanitization — sanitize_conversation_roles:
+    After the proxy rewrites a response into tool_calls format, Home Assistant
+    stores it in conversation history and echoes it back on the next turn.
+    hailo-ollama only supports system/user/assistant roles with non-null string
+    content; the OpenAI assistant+tool_calls (content:null) and role:tool messages
+    cause a null-pointer crash in oatpp. This layer rewrites those back to plain
+    assistant/user messages before forwarding.
+
 CLI args override environment variables, which override built-in defaults.
 """
 import argparse
@@ -284,6 +292,69 @@ def inject_defaults(body_bytes, path):
     return json.dumps(data).encode('utf-8')
 
 
+def sanitize_conversation_roles(body_bytes):
+    """Convert OpenAI-only message roles that hailo-ollama does not support.
+
+    hailo-ollama (oatpp / HailoRT) only handles system/user/assistant roles
+    with non-null string content. After the proxy rewrites a response into
+    tool_calls format, Home Assistant stores that in conversation history and
+    echoes it back on the next turn, introducing two unsupported constructs:
+
+      assistant + tool_calls + content:null
+        → hailo-ollama dereferences content as std::string → null-pointer crash
+        → rewritten to: assistant with the tool call serialised as JSON text
+
+      role:"tool" (tool result)
+        → unknown role → crash or silent drop
+        → rewritten to: user message "Result of <name>: <content>"
+
+    This runs before sanitize_for_hailo so the new string values get their
+    newlines collapsed in the same pass.
+    """
+    try:
+        data = json.loads(body_bytes.decode('utf-8'))
+    except Exception:
+        return body_bytes
+
+    messages = data.get('messages', [])
+    changed = False
+    new_messages = []
+
+    for msg in messages:
+        role = msg.get('role')
+
+        if role == 'assistant' and msg.get('tool_calls') and not msg.get('content'):
+            # Serialise each tool call back to a JSON string so the model has
+            # context about what it previously called.
+            parts = []
+            for tc in msg['tool_calls']:
+                fn = tc.get('function', {})
+                try:
+                    args = json.loads(fn.get('arguments', '{}'))
+                except Exception:
+                    args = fn.get('arguments', '')
+                parts.append(json.dumps({'name': fn.get('name', ''), 'arguments': args}))
+            new_messages.append({'role': 'assistant', 'content': ' '.join(parts)})
+            changed = True
+
+        elif role == 'tool':
+            # Fold the tool result into a user turn so the model sees the outcome.
+            name = msg.get('name', 'tool')
+            content = msg.get('content', '')
+            new_messages.append({'role': 'user',
+                                  'content': 'Result of {}: {}'.format(name, content)})
+            changed = True
+
+        else:
+            new_messages.append(msg)
+
+    if not changed:
+        return body_bytes
+
+    data['messages'] = new_messages
+    return json.dumps(data).encode('utf-8')
+
+
 def inject_tool_prompt(body_bytes):
     """hailo-tools-v1 (request side)
 
@@ -508,8 +579,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         had_tools = False
         if body and self.headers.get('Content-Type', '').startswith('application/json'):
             body = fix_json_control_chars(body)
-            body, had_tools = inject_tool_prompt(body)  # extract tools before sanitize
-            body = sanitize_for_hailo(body)             # collapse newlines incl. injected text
+            body, had_tools = inject_tool_prompt(body)       # extract tools, inject prompt
+            body = sanitize_conversation_roles(body)         # fix null content / tool roles
+            body = sanitize_for_hailo(body)                  # collapse newlines
             body = inject_defaults(body, self.path)
         _debug_log('REQ', self.command, self.path, body)
         req = urllib.request.Request(
