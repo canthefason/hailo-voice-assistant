@@ -435,19 +435,17 @@ def inject_tool_prompt(body_bytes):
         for t in tools if 'function' in t
     )
 
-    # Examples — order matters. Plain on/off come FIRST because they are by far
-    # the most common voice command and the model's recency bias was leading it
-    # to pick a brightness-style entity id when only the dim examples were near
-    # the top. Brightness phrasings follow because qwen2.5:1.5b otherwise
-    # invents `set_brightness_pct`, `value`, `brightness` (no _pct), or omits
-    # the brightness entirely. Single-line — sanitize_for_hailo collapses \n.
+    # Concrete examples covering the phrasings qwen2.5:1.5b otherwise gets wrong:
+    #   - "set to N%" / "at N%" / "brighter" / "darker" — model invents
+    #     `set_brightness_pct`, `value`, `brightness` (no _pct), or omits the
+    #     brightness entirely. Mapping all of these to the same turn_on +
+    #     brightness_pct shape via examples corrects the pattern match.
+    # Order matters: the brightness examples are first because in live tests
+    # the dim/set/at-N% phrasings are the most accuracy-sensitive. Reordering
+    # to put plain on/off at the top regressed dim accuracy from 6/8 to 3/8
+    # without fixing the on/off entity hallucination we hoped it would.
+    # Single-line — sanitize_for_hailo will run next and collapse any \n to spaces.
     example = (
-        'turn on: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights"}}]}} '
-        'turn off: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_off", '
-        '"service_data": {"entity_id": "light.office_lights"}}]}} '
         'dim to 30%: {"name": "execute_services", "arguments": {"list": ['
         '{"domain": "light", "service": "turn_on", '
         '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 30}}]}} '
@@ -462,7 +460,13 @@ def inject_tool_prompt(body_bytes):
         '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 80}}]}} '
         'make dimmer: {"name": "execute_services", "arguments": {"list": ['
         '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 20}}]}}'
+        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 20}}]}} '
+        'turn on: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_on", '
+        '"service_data": {"entity_id": "light.office_lights"}}]}} '
+        'turn off: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_off", '
+        '"service_data": {"entity_id": "light.office_lights"}}]}}'
     )
 
     instruction = (

@@ -27,8 +27,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Multi-distinct-entity drop: when more than one distinct `entity_id` remains after coalesce, only the first item is kept. Project scope is single-device commands and the second entity has consistently been bogus in observed traffic
 - Follow-up reply truncated to the first sentence — kills the multi-paragraph hallucinated entity roll-call ("the main bedroom lights remained off, the table lights were turned off, …") that came after an otherwise correct opening sentence
 - Follow-up reply also blanked when the model emits a JSON tool-call shape (e.g. `{"list":[]}`) instead of natural language; previously the JSON was read aloud
-- Injected examples reordered: plain `turn on` / `turn off` are now first; brightness phrasings follow. Recency bias on the prior ordering caused the model to hallucinate a Zigbee-style `entity_id` for the simple on/off commands when several brightness examples sat at the top of the example list
 - Entity-id allowlist: the proxy scrapes HA's "Available Devices" list from the request system prompt and rejects any tool call whose `entity_id` is not in that set. Hallucinated ids no longer reach HA; the response falls through to silent JSON-blanking instead of speaking an HA `Unable to find entity` error
+- Example ordering kept brightness-first (kept after a reorder experiment): putting plain `turn on` / `turn off` at the top of the example list was tried as a fix for the on/off entity hallucination but regressed dim accuracy from 6/8 to 3/8 without fixing the hallucination. The original brightness-first order is more accuracy-sensitive overall
 
 ### Fixed
 - `hailo_ollama_proxy`: stray trailing `"` appended by the model to its JSON output (e.g. `{...}}"`) caused `json.loads` to fail and the tool call rewrite to fall through to plain text; `_fix_json` now strips leading/trailing quote characters before any parse attempt
