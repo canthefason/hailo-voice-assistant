@@ -11,9 +11,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - Injected tool call examples reordered: dim (with `brightness_pct`) is now first so the model pattern-matches against it for brightness commands
 - Added `turn off` as a third injected example — model was using `turn_on` for all commands including off requests
+- Tool injection on tool-result follow-up turns now skips the JSON-only example block and asks for a one-sentence natural-language confirmation instead. Previously the model parroted JSON back after every successful action, validation rejected it as `{"list":[{}]}`, and HA's TTS read the raw JSON aloud
+- System prompt rules tightened: explicit instructions against repeating `service_data` and against appending the friendly-name suffix to `entity_id`
 
 ### Fixed
 - `hailo_ollama_proxy`: stray trailing `"` appended by the model to its JSON output (e.g. `{...}}"`) caused `json.loads` to fail and the tool call rewrite to fall through to plain text; `_fix_json` now strips leading/trailing quote characters before any parse attempt
+- `hailo_ollama_proxy`: model output with two `service_data` keys in one service entry (e.g. `entity_id` in one, `brightness_pct` in the next) lost the `entity_id` after parsing; new `_merge_duplicate_service_data` pre-pass merges them before `json.loads`
+- `hailo_ollama_proxy`: `entity_id` values copied from HA's CSV-formatted entity list with a `,Friendly Name` suffix (e.g. `light.0x001788...,Guest Room Light`) are now stripped to the bare dotted id before validation
+- `hailo_ollama_proxy`: when a JSON-shaped response fails tool-call validation or cannot be parsed at all, `content` is now blanked to `""` instead of being passed through verbatim, so HA's TTS no longer reads raw JSON aloud as the spoken reply
 
 ---
 

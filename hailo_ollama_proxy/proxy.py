@@ -355,6 +355,21 @@ def sanitize_conversation_roles(body_bytes):
     return json.dumps(data).encode('utf-8')
 
 
+def _is_tool_result_followup(messages):
+    """True if the request is HA echoing a tool result for natural-language summary.
+
+    HA's flow after a successful tool_call: it appends a {role:"tool", ...}
+    message and re-sends with tools[] still present, expecting the model to
+    summarise the outcome. Injecting JSON-only instructions on this turn makes
+    the model emit another (empty) tool call — which then fails validation and
+    leaves raw JSON in the spoken response.
+    """
+    for msg in messages:
+        if msg.get('role') == 'tool':
+            return True
+    return False
+
+
 def inject_tool_prompt(body_bytes):
     """hailo-tools-v1 (request side)
 
@@ -365,7 +380,13 @@ def inject_tool_prompt(body_bytes):
          (no literal newlines — sanitize_for_hailo runs after this)
       3. Removes tools/tool_choice from the request body
 
-    Returns (transformed_body_bytes, had_tools: bool).
+    On tool-result follow-up turns we strip tools/tool_choice but skip the
+    JSON-only injection — the model should respond in natural language so HA
+    has something speakable to read.
+
+    Returns (transformed_body_bytes, had_tools: bool). had_tools controls
+    whether rewrite_tool_response runs; we set it False on follow-up turns
+    so a natural-language reply is passed through untouched.
     """
     try:
         data = json.loads(body_bytes.decode('utf-8'))
@@ -375,6 +396,27 @@ def inject_tool_prompt(body_bytes):
     tools = data.get('tools')
     if not tools:
         return body_bytes, False
+
+    messages = data.get('messages', [])
+    followup = _is_tool_result_followup(messages)
+
+    # Remove fields hailo-ollama does not understand — always.
+    data.pop('tools', None)
+    data.pop('tool_choice', None)
+
+    if followup:
+        # Tool already executed; ask for a one-sentence natural-language summary.
+        # Skipping the example injection avoids the model parroting JSON back.
+        followup_hint = (
+            ' The previous tool call already executed. Reply in plain English'
+            ' with a single short sentence confirming what was done. Do not'
+            ' emit JSON.'
+        )
+        for msg in messages:
+            if msg.get('role') == 'system':
+                msg['content'] = (msg.get('content') or '') + followup_hint
+                break
+        return json.dumps(data).encode('utf-8'), False
 
     # Compact description of all available tools
     tool_desc = ' | '.join(
@@ -400,12 +442,13 @@ def inject_tool_prompt(body_bytes):
     instruction = (
         ' TOOL CALL RULES: Respond with ONLY a JSON object — no markdown, no explanation, nothing else.'
         ' Use this exact format: {"name": "<tool_name>", "arguments": <arguments object>}.'
+        ' Put all fields for one service (entity_id, brightness_pct, etc) inside a SINGLE service_data object — never repeat the service_data key.'
+        ' entity_id must be exactly the dotted id (e.g. "light.office_lights") with no friendly-name suffix.'
         ' Available tools: ' + tool_desc + '.'
         ' Example: ' + example
     )
 
     # Append to the existing system message, or prepend a new one
-    messages = data.get('messages', [])
     injected = False
     for msg in messages:
         if msg.get('role') == 'system':
@@ -415,10 +458,6 @@ def inject_tool_prompt(body_bytes):
     if not injected:
         messages.insert(0, {'role': 'system', 'content': instruction.strip()})
         data['messages'] = messages
-
-    # Remove fields hailo-ollama does not understand
-    data.pop('tools', None)
-    data.pop('tool_choice', None)
 
     # Ensure enough headroom for a complete tool call JSON.
     # inject_defaults caps max_tokens at ARGS.max_tokens (default 120) to limit
@@ -465,6 +504,68 @@ def _fix_json(text):
     return text
 
 
+def _merge_duplicate_service_data(text):
+    """Merge repeated `"service_data": {...}` blocks inside a single object.
+
+    The model occasionally splits a single service call into two service_data
+    keys (e.g. one with entity_id, another with brightness_pct). json.loads
+    keeps only the last duplicate, dropping the entity_id and breaking
+    validation. Detected by counting nested service_data occurrences inside
+    one `{ ... }` and merging their contents before parse.
+
+    Best-effort regex pass — any object that doesn't match cleanly is left
+    unchanged for the regular parser to handle.
+    """
+    pattern = re.compile(
+        r'"service_data"\s*:\s*(\{[^{}]*\})\s*,\s*"service_data"\s*:\s*(\{[^{}]*\})'
+    )
+
+    def merge(m):
+        try:
+            a = json.loads(m.group(1))
+            b = json.loads(m.group(2))
+            a.update(b)
+            return '"service_data": ' + json.dumps(a)
+        except Exception:
+            return m.group(0)
+
+    prev = None
+    while prev != text:
+        prev = text
+        text = pattern.sub(merge, text)
+    return text
+
+
+_ENTITY_ID_RE = re.compile(r'^([a-z_]+\.[a-zA-Z0-9_]+)')
+
+
+def _clean_entity_id(value):
+    """Strip trailing `,Friendly Name` suffix the model sometimes appends.
+
+    HA's system prompt formats entities as CSV `entity_id,Friendly Name,state`
+    and the model occasionally copies the friendly-name fragment into the
+    entity_id value. Anything after the first valid `domain.object_id` token
+    is dropped.
+    """
+    if not isinstance(value, str):
+        return value
+    m = _ENTITY_ID_RE.match(value)
+    return m.group(1) if m else value
+
+
+def _scrub_arguments(args):
+    """Walk execute_services arguments and clean entity_id fields in place."""
+    if not isinstance(args, dict):
+        return args
+    for item in args.get('list', []) or []:
+        if not isinstance(item, dict):
+            continue
+        sd = item.get('service_data')
+        if isinstance(sd, dict) and 'entity_id' in sd:
+            sd['entity_id'] = _clean_entity_id(sd['entity_id'])
+    return args
+
+
 def _try_parse_tool_call(text):
     """Extract (fn_name, arguments_dict) from model output, or return None.
 
@@ -473,15 +574,17 @@ def _try_parse_tool_call(text):
       {"list": [...]}                        bare execute_services arguments
       fn_name({"list": [...]})               Python-style call notation
       ```json\\n{...}\\n```                  markdown-wrapped JSON
-    Trailing commas and markdown fences are repaired before parsing.
+    Trailing commas and markdown fences are repaired before parsing, and
+    duplicate service_data keys inside one object are merged.
     """
-    text = _fix_json(text.strip())
+    text = _merge_duplicate_service_data(_fix_json(text.strip()))
 
     # Pattern: func_name({...})
     fn_match = re.match(r'^(\w+)\s*\((\{.+\})\)\s*$', text, re.DOTALL)
     if fn_match:
         try:
-            return fn_match.group(1), json.loads(_fix_json(fn_match.group(2)))
+            inner = _merge_duplicate_service_data(_fix_json(fn_match.group(2)))
+            return fn_match.group(1), _scrub_arguments(json.loads(inner))
         except Exception:
             pass
 
@@ -491,10 +594,10 @@ def _try_parse_tool_call(text):
         if isinstance(parsed, dict):
             # {"name": "...", "arguments": {...}}
             if 'name' in parsed and 'arguments' in parsed:
-                return parsed['name'], parsed['arguments']
+                return parsed['name'], _scrub_arguments(parsed['arguments'])
             # {"list": [...]} — bare execute_services arguments
             if 'list' in parsed:
-                return 'execute_services', parsed
+                return 'execute_services', _scrub_arguments(parsed)
     except Exception:
         pass
 
@@ -521,6 +624,13 @@ def _validate_tool_arguments(fn_name, arguments):
     return True
 
 
+def _looks_like_json(text):
+    """Cheap heuristic: model output that opens with `{` or ```` ``` ```` is
+    structured JSON we don't want HA's TTS reading aloud verbatim."""
+    s = text.lstrip()
+    return s.startswith('{') or s.startswith('```') or s.startswith('"{')
+
+
 def rewrite_tool_response(body_bytes):
     """hailo-tools-v1 (response side)
 
@@ -531,9 +641,10 @@ def rewrite_tool_response(body_bytes):
       - message.tool_calls → [{id, type, function: {name, arguments}}]
       - finish_reason → "tool_calls"
 
-    If the content cannot be parsed as a tool call, or parses but fails
-    validation (e.g. empty service objects), it is returned unchanged so HA
-    receives a plain text fallback rather than a broken service call.
+    If the content parses as a tool call but fails validation (e.g. empty
+    service objects), or looks like JSON but cannot be parsed at all, the
+    content is blanked to an empty string so HA's TTS does not read raw
+    JSON aloud. Plain prose is passed through unchanged.
     """
     try:
         resp = json.loads(body_bytes.decode('utf-8'))
@@ -553,32 +664,42 @@ def rewrite_tool_response(body_bytes):
 
     content = message.get('content') or ''
     result = _try_parse_tool_call(content)
-    if result is None:
-        return body_bytes
 
-    fn_name, arguments = result
-    if not _validate_tool_arguments(fn_name, arguments):
+    if result is not None:
+        fn_name, arguments = result
+        if _validate_tool_arguments(fn_name, arguments):
+            choice['message'] = {
+                'role': 'assistant',
+                'content': None,
+                'tool_calls': [{
+                    'id': 'call_0',
+                    'type': 'function',
+                    'function': {
+                        'name': fn_name,
+                        'arguments': json.dumps(arguments),
+                    }
+                }]
+            }
+            choice['finish_reason'] = 'tool_calls'
+            resp['choices'] = [choice]
+            return json.dumps(resp).encode('utf-8')
+
         sys.stderr.write(
             '[proxy] tool call validation failed — incomplete arguments for {}: {}\n'
             .format(fn_name, json.dumps(arguments))
         )
-        return body_bytes
+        # Fall through to JSON-blanking below: we won't speak the bad call.
 
-    choice['message'] = {
-        'role': 'assistant',
-        'content': None,
-        'tool_calls': [{
-            'id': 'call_0',
-            'type': 'function',
-            'function': {
-                'name': fn_name,
-                'arguments': json.dumps(arguments),
-            }
-        }]
-    }
-    choice['finish_reason'] = 'tool_calls'
-    resp['choices'] = [choice]
-    return json.dumps(resp).encode('utf-8')
+    if _looks_like_json(content):
+        # Parsed-but-invalid or unparseable JSON-shaped output — silence it so
+        # HA does not read "name execute services arguments list" aloud.
+        sys.stderr.write('[proxy] suppressed JSON-shaped content from spoken response\n')
+        message['content'] = ''
+        choice['message'] = message
+        resp['choices'] = [choice]
+        return json.dumps(resp).encode('utf-8')
+
+    return body_bytes
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
