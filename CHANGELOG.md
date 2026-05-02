@@ -15,8 +15,6 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - `hailo_ollama_proxy`: stray trailing `"` appended by the model to its JSON output (e.g. `{...}}"`) caused `json.loads` to fail and the tool call rewrite to fall through to plain text; `_fix_json` now strips leading/trailing quote characters before any parse attempt
 
----
-
 ## [1.0.7] — 2026-05-01
 
 ### Fixed
@@ -113,7 +111,6 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-[Unreleased]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.8...HEAD
 [1.0.8]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.5...v1.0.6
