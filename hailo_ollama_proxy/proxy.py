@@ -386,12 +386,15 @@ def inject_tool_prompt(body_bytes):
     # Two examples help the model generalise: one for on/off, one for dimming.
     # Single-line — sanitize_for_hailo will run next and collapse any \n to spaces.
     example = (
+        'dim to 30%: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_on", '
+        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 30}}]}} '
         'turn on: {"name": "execute_services", "arguments": {"list": ['
         '{"domain": "light", "service": "turn_on", '
         '"service_data": {"entity_id": "light.office_lights"}}]}} '
-        'dim to 30%: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 30}}]}}'
+        'turn off: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_off", '
+        '"service_data": {"entity_id": "light.office_lights"}}]}}'
     )
 
     instruction = (
