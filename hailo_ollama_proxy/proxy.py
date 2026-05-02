@@ -382,13 +382,16 @@ def inject_tool_prompt(body_bytes):
         for t in tools if 'function' in t
     )
 
-    # Concrete example using the execute_services schema HA always sends.
+    # Concrete examples using the execute_services schema HA always sends.
+    # Two examples help the model generalise: one for on/off, one for dimming.
     # Single-line — sanitize_for_hailo will run next and collapse any \n to spaces.
     example = (
-        '{"name": "execute_services", "arguments": {"list": ['
+        'turn on: {"name": "execute_services", "arguments": {"list": ['
         '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 50}}'
-        ']}}'
+        '"service_data": {"entity_id": "light.office_lights"}}]}} '
+        'dim to 30%: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_on", '
+        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 30}}]}}'
     )
 
     instruction = (
@@ -492,18 +495,39 @@ def _try_parse_tool_call(text):
     return None
 
 
+def _validate_tool_arguments(fn_name, arguments):
+    """Return True if the tool call arguments look actionable.
+
+    Catches cases where the model generates the right structure but leaves
+    required fields empty (e.g. {"list": [{}]}), which causes HA to raise
+    'Unexpected error during intent recognition'.
+    """
+    if fn_name == 'execute_services':
+        items = arguments.get('list', [])
+        if not items:
+            return False
+        for item in items:
+            if not item.get('domain') or not item.get('service'):
+                return False
+            svc_data = item.get('service_data', {})
+            if not svc_data.get('entity_id'):
+                return False
+    return True
+
+
 def rewrite_tool_response(body_bytes):
     """hailo-tools-v1 (response side)
 
     hailo-ollama returns the model output as plain text in message.content.
-    This layer parses that text, and if it looks like a tool call, rewrites
-    the response into the OpenAI tool_calls format that Home Assistant expects:
+    This layer parses that text, and if it looks like a valid tool call,
+    rewrites the response into the OpenAI tool_calls format HA expects:
       - message.content → null
       - message.tool_calls → [{id, type, function: {name, arguments}}]
       - finish_reason → "tool_calls"
 
-    If the content cannot be parsed as a tool call it is returned unchanged,
-    so HA gets the plain text reply as a fallback.
+    If the content cannot be parsed as a tool call, or parses but fails
+    validation (e.g. empty service objects), it is returned unchanged so HA
+    receives a plain text fallback rather than a broken service call.
     """
     try:
         resp = json.loads(body_bytes.decode('utf-8'))
@@ -527,6 +551,13 @@ def rewrite_tool_response(body_bytes):
         return body_bytes
 
     fn_name, arguments = result
+    if not _validate_tool_arguments(fn_name, arguments):
+        sys.stderr.write(
+            '[proxy] tool call validation failed — incomplete arguments for {}: {}\n'
+            .format(fn_name, json.dumps(arguments))
+        )
+        return body_bytes
+
     choice['message'] = {
         'role': 'assistant',
         'content': None,
