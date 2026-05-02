@@ -19,3 +19,7 @@ hailo-ollama-blog-post.md
 
 # macOS
 .DS_Store
+
+# Per-machine Claude Code state (.claude/skills/ stays tracked)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
