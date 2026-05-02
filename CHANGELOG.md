@@ -10,6 +10,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.6] — 2026-05-01
+
+### Fixed
+- `hailo_ollama_proxy`: null-pointer crash (HTTP 500) when Home Assistant sends back conversation history after a tool call
+  - After the proxy rewrites a response into `tool_calls` format, HA echoes the history back with `{"role": "assistant", "content": null, "tool_calls": [...]}` and `{"role": "tool", ...}` messages; hailo-ollama (oatpp/C++) dereferences `content` as `std::string` and crashes on null
+  - Added `sanitize_conversation_roles()` to the request pipeline: converts `assistant+tool_calls+null content` to a plain assistant message with the tool call serialised as JSON text, and `role:tool` to a `role:user` message with the result
+
+---
+
 ## [1.0.5] — 2026-05-01
 
 ### Fixed
@@ -87,7 +96,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-[Unreleased]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.5...HEAD
+[Unreleased]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.6...HEAD
+[1.0.6]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/canthefason/hailo-voice-assistant/compare/v1.0.2...v1.0.3
