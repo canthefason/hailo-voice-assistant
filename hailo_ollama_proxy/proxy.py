@@ -435,13 +435,19 @@ def inject_tool_prompt(body_bytes):
         for t in tools if 'function' in t
     )
 
-    # Concrete examples covering the phrasings qwen2.5:1.5b otherwise gets wrong:
-    #   - "set to N%" / "at N%" / "brighter" / "darker" — model invents
-    #     `set_brightness_pct`, `value`, `brightness` (no _pct), or omits the
-    #     brightness entirely. Mapping all of these to the same turn_on +
-    #     brightness_pct shape via examples corrects the pattern match.
-    # Single-line — sanitize_for_hailo will run next and collapse any \n to spaces.
+    # Examples — order matters. Plain on/off come FIRST because they are by far
+    # the most common voice command and the model's recency bias was leading it
+    # to pick a brightness-style entity id when only the dim examples were near
+    # the top. Brightness phrasings follow because qwen2.5:1.5b otherwise
+    # invents `set_brightness_pct`, `value`, `brightness` (no _pct), or omits
+    # the brightness entirely. Single-line — sanitize_for_hailo collapses \n.
     example = (
+        'turn on: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_on", '
+        '"service_data": {"entity_id": "light.office_lights"}}]}} '
+        'turn off: {"name": "execute_services", "arguments": {"list": ['
+        '{"domain": "light", "service": "turn_off", '
+        '"service_data": {"entity_id": "light.office_lights"}}]}} '
         'dim to 30%: {"name": "execute_services", "arguments": {"list": ['
         '{"domain": "light", "service": "turn_on", '
         '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 30}}]}} '
@@ -456,13 +462,7 @@ def inject_tool_prompt(body_bytes):
         '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 80}}]}} '
         'make dimmer: {"name": "execute_services", "arguments": {"list": ['
         '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 20}}]}} '
-        'turn on: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights"}}]}} '
-        'turn off: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_off", '
-        '"service_data": {"entity_id": "light.office_lights"}}]}}'
+        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 20}}]}}'
     )
 
     instruction = (
@@ -565,6 +565,37 @@ def _merge_duplicate_service_data(text):
 
 
 _ENTITY_ID_RE = re.compile(r'^([a-z_]+\.[a-zA-Z0-9_]+)')
+
+# Loose match for any entity_id token anywhere in a string (used to scrape
+# HA's "Available Devices: ..." section in the system prompt).
+_ENTITY_ID_TOKEN_RE = re.compile(r'\b([a-z_]+\.[a-zA-Z0-9_]+)\b')
+
+
+def extract_known_entities(body_bytes):
+    """Return the set of entity_ids HA listed in the system prompt, or None.
+
+    HA's Extended OpenAI Conversation integration formats exposed devices as
+    `Available Devices: light.x,Friendly,state light.y,Friendly,state ...`
+    inside the system message. Regex-scrape `domain.object_id` tokens from
+    every message; we use this set to validate model-emitted entity_ids
+    after parsing the response so hallucinated ids don't reach HA.
+
+    Returns None if no system message is found, signalling "skip validation"
+    to downstream callers.
+    """
+    try:
+        data = json.loads(body_bytes.decode('utf-8'))
+    except Exception:
+        return None
+    found = set()
+    for msg in data.get('messages', []):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get('content')
+        if isinstance(content, str):
+            for tok in _ENTITY_ID_TOKEN_RE.findall(content):
+                found.add(tok)
+    return found or None
 
 
 def _clean_entity_id(value):
@@ -788,12 +819,18 @@ def _try_parse_tool_call(text):
     return None
 
 
-def _validate_tool_arguments(fn_name, arguments):
+def _validate_tool_arguments(fn_name, arguments, known_entities=None):
     """Return True if the tool call arguments look actionable.
 
-    Catches cases where the model generates the right structure but leaves
-    required fields empty (e.g. {"list": [{}]}), which causes HA to raise
-    'Unexpected error during intent recognition'.
+    Catches:
+      - empty / missing fields (e.g. {"list": [{}]}) → HA raises
+        "Unexpected error during intent recognition"
+      - entity_id not present in HA's exposed-device list → HA returns
+        "Unable to find entity ['<id>']" and the user hears that error
+        spoken; we'd rather silence the reply than read an HA error aloud.
+
+    `known_entities` is the set returned by extract_known_entities(); pass
+    None to skip the entity-id allowlist check.
     """
     if fn_name == 'execute_services':
         items = arguments.get('list', [])
@@ -803,7 +840,14 @@ def _validate_tool_arguments(fn_name, arguments):
             if not item.get('domain') or not item.get('service'):
                 return False
             svc_data = item.get('service_data', {})
-            if not svc_data.get('entity_id'):
+            entity_id = svc_data.get('entity_id')
+            if not entity_id:
+                return False
+            if known_entities is not None and entity_id not in known_entities:
+                sys.stderr.write(
+                    '[proxy] entity_id {!r} not in HA exposed list — rejecting tool call\n'
+                    .format(entity_id)
+                )
                 return False
     return True
 
@@ -815,7 +859,7 @@ def _looks_like_json(text):
     return s.startswith('{') or s.startswith('```') or s.startswith('"{')
 
 
-def rewrite_tool_response(body_bytes):
+def rewrite_tool_response(body_bytes, known_entities=None):
     """hailo-tools-v1 (response side)
 
     hailo-ollama returns the model output as plain text in message.content.
@@ -826,9 +870,13 @@ def rewrite_tool_response(body_bytes):
       - finish_reason → "tool_calls"
 
     If the content parses as a tool call but fails validation (e.g. empty
-    service objects), or looks like JSON but cannot be parsed at all, the
-    content is blanked to an empty string so HA's TTS does not read raw
-    JSON aloud. Plain prose is passed through unchanged.
+    service objects, hallucinated entity_id), or looks like JSON but cannot
+    be parsed at all, the content is blanked to an empty string so HA's
+    TTS does not read raw JSON or HA error messages aloud. Plain prose is
+    passed through unchanged.
+
+    `known_entities`: optional set of entity_ids HA exposed to the model
+    (extracted from the request body); used to reject hallucinated ids.
     """
     try:
         resp = json.loads(body_bytes.decode('utf-8'))
@@ -851,7 +899,7 @@ def rewrite_tool_response(body_bytes):
 
     if result is not None:
         fn_name, arguments = result
-        if _validate_tool_arguments(fn_name, arguments):
+        if _validate_tool_arguments(fn_name, arguments, known_entities):
             choice['message'] = {
                 'role': 'assistant',
                 'content': None,
@@ -869,7 +917,7 @@ def rewrite_tool_response(body_bytes):
             return json.dumps(resp).encode('utf-8')
 
         sys.stderr.write(
-            '[proxy] tool call validation failed — incomplete arguments for {}: {}\n'
+            '[proxy] tool call validation failed for {}: {}\n'
             .format(fn_name, json.dumps(arguments))
         )
         # Fall through to JSON-blanking below: we won't speak the bad call.
@@ -893,13 +941,19 @@ _SENTENCE_END_RE = re.compile(r'([.!?])\s+(?=[A-Z])')
 
 
 def truncate_followup_response(body_bytes):
-    """Cap the assistant reply at the first sentence on tool-result follow-up turns.
+    """Clean up the assistant reply on tool-result follow-up turns.
 
-    qwen2.5:1.5b reliably produces a correct opening sentence ("The office
-    lights were turned on at 70 percent brightness.") and then keeps writing,
-    listing every entity from the system prompt and inventing details about
-    each. Truncating after the first sentence keeps the accurate part and
-    drops the hallucinations.
+    Two forms of cleanup:
+      1. JSON suppression — model occasionally re-emits a JSON tool call
+         (e.g. `{"name":"execute_services","arguments":{"list":[]}}`)
+         instead of natural language; that would be read aloud verbatim.
+         Blank to "" so HA's TTS stays silent.
+      2. First-sentence truncation — qwen2.5:1.5b reliably produces a
+         correct opening sentence ("The office lights were turned on at
+         70 percent brightness.") and then keeps writing, listing every
+         entity from the system prompt and inventing details about each.
+         Truncating after the first sentence keeps the accurate part and
+         drops the hallucinations.
     """
     try:
         resp = json.loads(body_bytes.decode('utf-8'))
@@ -914,6 +968,13 @@ def truncate_followup_response(body_bytes):
     content = message.get('content')
     if not isinstance(content, str) or not content.strip():
         return body_bytes
+
+    if _looks_like_json(content):
+        sys.stderr.write('[proxy] suppressed JSON-shaped content from follow-up reply\n')
+        message['content'] = ''
+        choice['message'] = message
+        resp['choices'] = [choice]
+        return json.dumps(resp).encode('utf-8')
 
     m = _SENTENCE_END_RE.search(content)
     if m:
@@ -960,9 +1021,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         body   = self.rfile.read(length) if length > 0 else None
         tool_mode = False  # False | True | 'followup'
+        known_entities = None
         if body and self.headers.get('Content-Type', '').startswith('application/json'):
             body = fix_json_control_chars(body)
             body, tool_mode = inject_tool_prompt(body)       # extract tools, inject prompt
+            if tool_mode is True:
+                # Snapshot the entity allowlist before sanitisation strips
+                # newlines / dedupes content; only used for tool turns.
+                known_entities = extract_known_entities(body)
             body = sanitize_conversation_roles(body)         # fix null content / tool roles
             body = sanitize_for_hailo(body)                  # collapse newlines
             body = inject_defaults(body, self.path)
@@ -976,7 +1042,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             r = urllib.request.urlopen(req, timeout=300)
             resp_body = r.read()
             if tool_mode is True:
-                resp_body = rewrite_tool_response(resp_body)
+                resp_body = rewrite_tool_response(resp_body, known_entities)
             elif tool_mode == 'followup':
                 resp_body = truncate_followup_response(resp_body)
             _debug_log('RES', r.status, self.path, resp_body)

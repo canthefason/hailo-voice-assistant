@@ -26,6 +26,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Cross-entity brightness rescue: when the model puts the user-intended action on entity A and a brightness on entity B (e.g. accidentally targeting `light.0x...,Guest Room Stand Light`), the brightness is copied onto A and the second item is dropped — observed as the dominant failure mode for "dim/set/at N%" phrasings on qwen2.5:1.5b
   - Multi-distinct-entity drop: when more than one distinct `entity_id` remains after coalesce, only the first item is kept. Project scope is single-device commands and the second entity has consistently been bogus in observed traffic
 - Follow-up reply truncated to the first sentence — kills the multi-paragraph hallucinated entity roll-call ("the main bedroom lights remained off, the table lights were turned off, …") that came after an otherwise correct opening sentence
+- Follow-up reply also blanked when the model emits a JSON tool-call shape (e.g. `{"list":[]}`) instead of natural language; previously the JSON was read aloud
+- Injected examples reordered: plain `turn on` / `turn off` are now first; brightness phrasings follow. Recency bias on the prior ordering caused the model to hallucinate a Zigbee-style `entity_id` for the simple on/off commands when several brightness examples sat at the top of the example list
+- Entity-id allowlist: the proxy scrapes HA's "Available Devices" list from the request system prompt and rejects any tool call whose `entity_id` is not in that set. Hallucinated ids no longer reach HA; the response falls through to silent JSON-blanking instead of speaking an HA `Unable to find entity` error
 
 ### Fixed
 - `hailo_ollama_proxy`: stray trailing `"` appended by the model to its JSON output (e.g. `{...}}"`) caused `json.loads` to fail and the tool call rewrite to fall through to plain text; `_fix_json` now strips leading/trailing quote characters before any parse attempt
