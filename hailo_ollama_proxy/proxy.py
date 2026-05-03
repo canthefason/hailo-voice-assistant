@@ -50,6 +50,17 @@ Conversation role sanitization — sanitize_conversation_roles:
     cause a null-pointer crash in oatpp. This layer rewrites those back to plain
     assistant/user messages before forwarding.
 
+Prompt strings — prompts.json (env: PROXY_CONFIG):
+    The three strings used by inject_tool_prompt live in prompts.json
+    next to this script (or the file given by --config / PROXY_CONFIG):
+      "example"               — few-shot examples
+      "instruction_template"  — injected into the system message; literal
+                                tokens {tool_desc} and {example} are
+                                replaced at request time
+      "followup_hint"         — appended on tool-result follow-up turns
+    Missing or empty values mean "inject nothing" for that slot — there
+    are no built-in fallback strings in the code.
+
 CLI args override environment variables, which override built-in defaults.
 """
 import argparse
@@ -73,6 +84,15 @@ def _parse_args():
     p.add_argument('--backend-port', type=int,
                    default=int(os.environ.get('HAILO_INTERNAL_PORT', '11436')),
                    help='hailo-ollama backend port (env: HAILO_INTERNAL_PORT)')
+    p.add_argument('--config', metavar='FILE',
+                   default=os.environ.get(
+                       'PROXY_CONFIG',
+                       os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts.json'),
+                   ),
+                   help='Path to a JSON config file for prompt strings '
+                        '(example, instruction_template, followup_hint). '
+                        'Defaults to prompts.json next to this script. '
+                        'Missing keys → no injection. (env: PROXY_CONFIG)')
     # Inference caps
     p.add_argument('--max-tokens', type=int, default=120,
                    help='Hard cap on max_tokens for /v1/chat/completions')
@@ -110,6 +130,44 @@ ARGS = _parse_args()
 LISTEN_PORT  = ARGS.listen_port
 BACKEND_PORT = ARGS.backend_port
 BACKEND = 'http://127.0.0.1:' + str(BACKEND_PORT)
+
+def _load_prompt_config(path):
+    """Load prompt strings from a JSON file (prompts.json by default).
+
+    Recognised keys (all optional):
+      "example"               — few-shot examples appended via {example} in instruction_template
+      "instruction_template"  — injected into system message on tool turns;
+                                {tool_desc} and {example} are simple token replacements
+      "followup_hint"         — appended to system message on tool-result follow-up turns
+
+    Missing or empty-string values mean "inject nothing" for that slot.
+    Unknown keys are ignored.
+    """
+    cfg = {'example': '', 'instruction_template': '', 'followup_hint': ''}
+    if not path:
+        return cfg
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        for key in cfg:
+            if key in data:
+                if not isinstance(data[key], str):
+                    sys.stderr.write(
+                        '[proxy] config: key {!r} must be a string — ignored\n'.format(key)
+                    )
+                    continue
+                cfg[key] = data[key]
+        sys.stderr.write('[proxy] loaded prompt config from {}\n'.format(path))
+    except FileNotFoundError:
+        sys.stderr.write('[proxy] prompts.json not found at {!r} — no prompt injection\n'
+                         .format(path))
+    except Exception as exc:
+        sys.stderr.write('[proxy] failed to load config {!r}: {} — no prompt injection\n'
+                         .format(path, exc))
+    return cfg
+
+
+PROMPT_CONFIG = _load_prompt_config(ARGS.config)
 
 _SEP = '─' * 60
 _SYSTEM_PROMPT_TRUNCATE = 200
@@ -422,21 +480,20 @@ def inject_tool_prompt(body_bytes):
         # devices). "Do not invent details" stops fabricated brightness values.
         # Even with this prompt the model often runs on past sentence one —
         # the response side truncates to the first sentence as a hard cap.
-        followup_hint = (
-            ' The previous tool call already executed. Reply with EXACTLY ONE'
-            ' short sentence confirming what was done to the specific device the'
-            ' user asked about. Do not mention any other devices. Do not invent'
-            ' details such as brightness values that were not in the tool call.'
-            ' Do not emit JSON.'
-        )
-        for msg in messages:
-            if msg.get('role') == 'system':
-                msg['content'] = (msg.get('content') or '') + followup_hint
-                break
+        followup_hint = PROMPT_CONFIG['followup_hint']
+        if followup_hint:
+            for msg in messages:
+                if msg.get('role') == 'system':
+                    msg['content'] = (msg.get('content') or '') + followup_hint
+                    break
         # had_tools=False so rewrite_tool_response is skipped, but we still
         # signal via the second return slot that the response should be
         # truncated. Caller treats False as "no tool rewrite" anyway.
         return json.dumps(data).encode('utf-8'), 'followup'
+
+    template = PROMPT_CONFIG['instruction_template']
+    if not template:
+        return json.dumps(data).encode('utf-8'), True
 
     # Compact description of all available tools
     tool_desc = ' | '.join(
@@ -444,50 +501,10 @@ def inject_tool_prompt(body_bytes):
         for t in tools if 'function' in t
     )
 
-    # Concrete examples covering the phrasings qwen2.5:1.5b otherwise gets wrong:
-    #   - "set to N%" / "at N%" / "brighter" / "darker" — model invents
-    #     `set_brightness_pct`, `value`, `brightness` (no _pct), or omits the
-    #     brightness entirely. Mapping all of these to the same turn_on +
-    #     brightness_pct shape via examples corrects the pattern match.
-    # Order matters: the brightness examples are first because in live tests
-    # the dim/set/at-N% phrasings are the most accuracy-sensitive. Reordering
-    # to put plain on/off at the top regressed dim accuracy from 6/8 to 3/8
-    # without fixing the on/off entity hallucination we hoped it would.
-    # Single-line — sanitize_for_hailo will run next and collapse any \n to spaces.
-    example = (
-        'dim to 30%: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 30}}]}} '
-        'set to 50%: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 50}}]}} '
-        'lights at 70%: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 70}}]}} '
-        'make brighter: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 80}}]}} '
-        'make dimmer: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights", "brightness_pct": 20}}]}} '
-        'turn on: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_on", '
-        '"service_data": {"entity_id": "light.office_lights"}}]}} '
-        'turn off: {"name": "execute_services", "arguments": {"list": ['
-        '{"domain": "light", "service": "turn_off", '
-        '"service_data": {"entity_id": "light.office_lights"}}]}}'
-    )
-
-    instruction = (
-        ' TOOL CALL RULES: Respond with ONLY a JSON object — no markdown, no explanation, nothing else.'
-        ' Use this exact format: {"name": "<tool_name>", "arguments": <arguments object>}.'
-        ' Output exactly ONE item in the "list" array per command, unless the user explicitly named multiple devices.'
-        ' Put all fields for one service (entity_id, brightness_pct, etc) inside a SINGLE service_data object — never repeat the service_data key.'
-        ' entity_id must be exactly the dotted id (e.g. "light.office_lights") with no friendly-name suffix.'
-        ' For brightness commands ("dim", "set to N%", "at N%", "brighter", "darker"): use service "turn_on" with "brightness_pct" (integer 0-100) inside service_data. NEVER use the keys "brightness" or "value", and NEVER use a service named "set_brightness_pct".'
-        ' Available tools: ' + tool_desc + '.'
-        ' Examples: ' + example
-    )
+    # {tool_desc} and {example} are simple token replacements — no .format() escaping needed.
+    instruction = (template
+                   .replace('{tool_desc}', tool_desc)
+                   .replace('{example}', PROMPT_CONFIG['example']))
 
     # Append to the existing system message, or prepend a new one
     injected = False

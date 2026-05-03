@@ -91,6 +91,21 @@ env:
   DEFAULT_PYTHON_VERSION: '3.11'
 
 jobs:
+  # ── Proxy unit tests — fast, native, no Docker overhead ─────────────────────
+  test-proxy:
+    name: Unit tests — hailo-ollama proxy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run proxy unit tests
+        run: |
+          cd hailo_ollama_proxy
+          python3 -m pytest test_proxy.py -v
+
   build:
     name: Build hailo-whisper (${{ inputs.whisper_model || 'small.en' }})
     runs-on: ubuntu-latest
@@ -256,6 +271,7 @@ jobs:
   # ══════════════════════════════════════════════════════════════════════════════
   build-hailo-ollama:
     name: Build hailo-ollama
+    needs: test-proxy
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
