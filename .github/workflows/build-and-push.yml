@@ -103,6 +103,7 @@ jobs:
 
       - name: Run proxy unit tests
         run: |
+          pip install pytest --quiet
           cd hailo_ollama_proxy
           python3 -m pytest test_proxy.py -v
 
