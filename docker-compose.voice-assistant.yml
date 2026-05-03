@@ -43,6 +43,11 @@ services:
       # Check your version: ls /usr/lib/libhailort.so.*
       - /usr/local/bin/hailo-ollama:/usr/local/bin/hailo-ollama:ro
       - /usr/lib/libhailort.so.5.3.0:/usr/lib/libhailort.so.5.3.0:ro
+      # Optional: override the default prompt config baked into the image.
+      # Copy prompts.json to the Pi and uncomment this line to customise
+      # tool-call examples, the instruction template, or the follow-up hint
+      # without rebuilding the image.
+      # - /home/ctf/homeassistant/prompts.json:/usr/local/bin/prompts.json:ro
 
   # ── Speech-to-Text / Wyoming (Hailo NPU) ───────────────────────────────────
   hailo-whisper:

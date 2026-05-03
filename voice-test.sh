@@ -7,11 +7,13 @@
 # whatever image is currently deployed on the Pi.
 #
 # Usage:
-#   bash voice-test.sh                      # default 8-command suite
-#   bash voice-test.sh "turn on the lights" # one ad-hoc command
-#   bash voice-test.sh -f commands.txt      # one command per line
-#   bash voice-test.sh --log                # also dump proxy traces from this run
-#   bash voice-test.sh --interval 30        # seconds between commands (default 45)
+#   bash voice-test.sh                          # default 8-command suite
+#   bash voice-test.sh "turn on the lights"     # one ad-hoc command
+#   bash voice-test.sh -f commands.txt          # one command per line
+#   bash voice-test.sh --log                    # also dump proxy traces from this run
+#   bash voice-test.sh --interval 30            # seconds between commands (default 45)
+#   bash voice-test.sh --benchmark results.jsonl            # append results to file
+#   bash voice-test.sh --benchmark results.jsonl --version v1.0.9  # with explicit version
 #
 # Env:
 #   HOME_ASSISTANT  Bearer token (required)
@@ -24,6 +26,12 @@
 #   ⊘  empty speech (proxy blanked a JSON-shaped or rejected reply;
 #                    action may or may not have run — check --log)
 #   ✘  HA error speech ("Something went wrong: …") or HTTP/parse failure
+#
+# Benchmark file format (JSONL — one JSON object per line):
+#   Per-command: {"type":"command","ts":"…","version":"…","command":"…",
+#                 "result":"pass|silent|fail","speech":"…","duration_s":12}
+#   Summary row: {"type":"summary","ts":"…","version":"…",
+#                 "pass":N,"silent":N,"fail":N,"total":N}
 # ============================================================
 set -euo pipefail
 
@@ -34,6 +42,8 @@ PI_SSH="${PI_SSH:-hailo-pi}"
 INTERVAL=45
 FETCH_LOGS=0
 COMMANDS_FILE=""
+BENCHMARK_FILE=""
+VERSION_LABEL=""
 ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -41,6 +51,8 @@ while [[ $# -gt 0 ]]; do
         -f|--file)         COMMANDS_FILE="$2"; shift 2 ;;
         --interval)        INTERVAL="$2"; shift 2 ;;
         --log|--logs)      FETCH_LOGS=1; shift ;;
+        --benchmark)       BENCHMARK_FILE="$2"; shift 2 ;;
+        --version)         VERSION_LABEL="$2"; shift 2 ;;
         -h|--help)
             sed -n '/^# voice-test.sh/,/^# ====/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -48,6 +60,11 @@ while [[ $# -gt 0 ]]; do
         *)                 ARGS+=("$1"); shift ;;
     esac
 done
+
+# Resolve version: explicit flag > git tag > "unknown"
+if [[ -z "$VERSION_LABEL" ]]; then
+    VERSION_LABEL=$(git -C "$(dirname "$0")" describe --tags --always 2>/dev/null || echo "unknown")
+fi
 
 [[ -n "${HOME_ASSISTANT:-}" ]] || {
     echo "✘ HOME_ASSISTANT env var is required (HA bearer token)" >&2
@@ -70,6 +87,15 @@ else
         "turn off the office lights"
     )
 fi
+
+# Append one JSONL record to the benchmark file (no-op when --benchmark not set).
+bm_write() {
+    [[ -z "$BENCHMARK_FILE" ]] && return 0
+    python3 -c '
+import json, sys
+print(json.dumps(json.loads(sys.argv[1])))
+' "$1" >> "$BENCHMARK_FILE"
+}
 
 # Snapshot proxy log offset so --log only shows lines from this run.
 log_offset=0
@@ -112,18 +138,43 @@ except Exception:
     print("__HTTP_PARSE_ERROR__")
 ' 2>/dev/null)
 
+    bm_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     if [[ "$speech" == "__HTTP_PARSE_ERROR__" ]]; then
         printf '  ✘  %2ds  HTTP/JSON error: %s\n' "$duration" "${resp:0:80}"
         fail=$((fail + 1))
+        bm_write "$(python3 -c '
+import json,sys
+print(json.dumps({"type":"command","ts":sys.argv[1],"version":sys.argv[2],
+    "command":sys.argv[3],"result":"fail","speech":"__HTTP_PARSE_ERROR__",
+    "duration_s":int(sys.argv[4])}))
+' "$bm_ts" "$VERSION_LABEL" "$cmd" "$duration")"
     elif [[ -z "$speech" ]]; then
         printf '  ⊘  %2ds  (silent)\n' "$duration"
         silent=$((silent + 1))
+        bm_write "$(python3 -c '
+import json,sys
+print(json.dumps({"type":"command","ts":sys.argv[1],"version":sys.argv[2],
+    "command":sys.argv[3],"result":"silent","speech":"",
+    "duration_s":int(sys.argv[4])}))
+' "$bm_ts" "$VERSION_LABEL" "$cmd" "$duration")"
     elif [[ "$speech" == "Something went wrong"* ]]; then
         printf '  ✘  %2ds  %s\n' "$duration" "$speech"
         fail=$((fail + 1))
+        bm_write "$(python3 -c '
+import json,sys
+print(json.dumps({"type":"command","ts":sys.argv[1],"version":sys.argv[2],
+    "command":sys.argv[3],"result":"fail","speech":sys.argv[5],
+    "duration_s":int(sys.argv[4])}))
+' "$bm_ts" "$VERSION_LABEL" "$cmd" "$duration" "$speech")"
     else
         printf '  ✔  %2ds  %s\n' "$duration" "$speech"
         pass=$((pass + 1))
+        bm_write "$(python3 -c '
+import json,sys
+print(json.dumps({"type":"command","ts":sys.argv[1],"version":sys.argv[2],
+    "command":sys.argv[3],"result":"pass","speech":sys.argv[5],
+    "duration_s":int(sys.argv[4])}))
+' "$bm_ts" "$VERSION_LABEL" "$cmd" "$duration" "$speech")"
     fi
 
     # Skip the trailing sleep on the last command.
@@ -134,6 +185,16 @@ done
 
 echo "════════════════════════════════════════════════════════════"
 printf 'Summary: %d ✔   %d ⊘   %d ✘   /  %d total\n' "$pass" "$silent" "$fail" "$total"
+
+if [[ -n "$BENCHMARK_FILE" ]]; then
+    bm_write "$(python3 -c '
+import json,sys
+print(json.dumps({"type":"summary","ts":sys.argv[1],"version":sys.argv[2],
+    "pass":int(sys.argv[3]),"silent":int(sys.argv[4]),
+    "fail":int(sys.argv[5]),"total":int(sys.argv[6])}))
+' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$VERSION_LABEL" "$pass" "$silent" "$fail" "$total")"
+    echo "Benchmark written → $BENCHMARK_FILE  (version: $VERSION_LABEL)"
+fi
 
 if [[ "$FETCH_LOGS" -eq 1 ]]; then
     echo "════════════════════════════════════════════════════════════"

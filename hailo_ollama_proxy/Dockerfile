@@ -44,8 +44,9 @@ COPY proxy.py      /tmp/proxy.py
 COPY test_proxy.py /tmp/test_proxy.py
 RUN cd /tmp && python3 -m pytest test_proxy.py -q && rm proxy.py test_proxy.py
 
-# Proxy and entrypoint — our code only, no Hailo IP
+# Proxy, prompt config, and entrypoint — our code only, no Hailo IP
 COPY proxy.py      /usr/local/bin/hailo-ollama-proxy.py
+COPY prompts.json  /usr/local/bin/prompts.json
 COPY entrypoint.sh /usr/local/bin/hailo-ollama-entrypoint.sh
 RUN chmod +x /usr/local/bin/hailo-ollama-entrypoint.sh
 
