@@ -17,6 +17,7 @@ Performance note:
   incurred NPU setup overhead (kernel calls, HEF programming, buffer allocation)
   on every utterance — the dominant latency source.
 """
+import json
 import logging
 import re
 import numpy as np
@@ -30,7 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 SAMPLE_RATE = 16_000
 SHARED_VDEVICE_GROUP_ID = "SHARED"
 
-# Known Whisper Small misrecognitions for this vocabulary.
+# Built-in fallback corrections used when no corrections file is provided.
 # Each tuple is (compiled pattern, replacement). Applied in order after transcription.
 _CORRECTIONS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bleaving room\b", re.IGNORECASE), "living room"),
@@ -40,8 +41,33 @@ _CORRECTIONS: list[tuple[re.Pattern, str]] = [
 ]
 
 
-def _apply_corrections(text: str) -> str:
-    for pattern, replacement in _CORRECTIONS:
+def _load_corrections_file(path: str) -> list[tuple[re.Pattern, str]]:
+    """Load corrections from a JSON file.
+
+    Expected format: array of [pattern, replacement] pairs.
+    All patterns are compiled with IGNORECASE; use inline (?-i) to override.
+
+    Example:
+        [
+          ["\\\\bleaving room\\\\b", "living room"],
+          ["\\\\bturn of\\\\b(?!\\\\s*f)", "turn off"]
+        ]
+    """
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, list):
+        raise ValueError(f"corrections file must be a JSON array, got {type(data).__name__}")
+    corrections = []
+    for i, entry in enumerate(data):
+        if not (isinstance(entry, list) and len(entry) == 2):
+            raise ValueError(f"corrections[{i}] must be a [pattern, replacement] pair")
+        pattern_str, replacement = entry
+        corrections.append((re.compile(pattern_str, re.IGNORECASE), replacement))
+    _LOGGER.info("Loaded %d correction(s) from %s", len(corrections), path)
+    return corrections
+
+
+def _apply_corrections(text: str, corrections: list[tuple[re.Pattern, str]]) -> str:
+    for pattern, replacement in corrections:
         text = pattern.sub(replacement, text)
     return text
 
@@ -61,11 +87,17 @@ class HailoWhisperCore:
         model_name: str = "small.en",
         language: str = "en",
         device_id: int = 0,
+        corrections_file: str | None = None,
     ):
         self.hef_path = str(hef_path)
         self.model_name = model_name
         self.language = language
         self.device_id = device_id
+
+        if corrections_file is not None:
+            self._corrections = _load_corrections_file(corrections_file)
+        else:
+            self._corrections = _CORRECTIONS
 
         if not Path(self.hef_path).is_file():
             raise FileNotFoundError(f"HEF not found: {self.hef_path}")
@@ -123,7 +155,7 @@ class HailoWhisperCore:
         )
 
         raw = "".join(seg.text for seg in segments).strip()
-        corrected = _apply_corrections(raw)
+        corrected = _apply_corrections(raw, self._corrections)
         _LOGGER.info("WHISPER_RAW: %s", raw)
         if corrected != raw:
             _LOGGER.info("WHISPER_CORRECTED: %s", corrected)

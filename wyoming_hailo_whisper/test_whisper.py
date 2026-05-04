@@ -79,7 +79,7 @@ import wyoming_hailo_whisper.handler as handler
 class TestApplyCorrections(unittest.TestCase):
 
     def _c(self, text: str) -> str:
-        return core._apply_corrections(text)
+        return core._apply_corrections(text, core._CORRECTIONS)
 
     # living room variants
     def test_leaving_room(self):

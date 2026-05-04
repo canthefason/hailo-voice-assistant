@@ -1,0 +1,6 @@
+[
+  ["\\bleaving room\\b", "living room"],
+  ["\\bliving rome\\b", "living room"],
+  ["\\bliving rum\\b", "living room"],
+  ["\\bturn of\\b(?!\\s*f)", "turn off"]
+]

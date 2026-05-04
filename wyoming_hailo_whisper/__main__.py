@@ -54,6 +54,12 @@ def main():
         help="Hailo device index (default: 0)",
     )
     parser.add_argument(
+        "--corrections-file",
+        default=None,
+        help="Path to JSON corrections file (array of [pattern, replacement] pairs). "
+             "If omitted, built-in corrections are used.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -71,6 +77,7 @@ def main():
         model_name=args.model,
         language=args.language,
         device_id=args.device_id,
+        corrections_file=args.corrections_file,
     )
     _LOGGER.info("Hailo Whisper core ready.")
 
