@@ -146,6 +146,7 @@ class TestHailoWhisperCoreTranscribe(unittest.TestCase):
             c.model_name = "small.en"
             c.language = "en"
             c.device_id = 0
+            c._corrections = core._CORRECTIONS
             mock_s2t = MagicMock()
             mock_s2t.generate_all_segments.return_value = segments
             c._speech2text = mock_s2t
