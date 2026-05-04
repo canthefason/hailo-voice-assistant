@@ -107,8 +107,24 @@ jobs:
           cd hailo_ollama_proxy
           python3 -m pytest test_proxy.py -v
 
+  # ── Whisper unit tests — fast, native, no Docker overhead ────────────────────
+  test-whisper:
+    name: Unit tests — hailo-whisper
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run whisper unit tests
+        run: |
+          pip install pytest numpy --quiet
+          python3 -m pytest wyoming_hailo_whisper/test_whisper.py -v
+
   build:
     name: Build hailo-whisper (${{ inputs.whisper_model || 'small.en' }})
+    needs: test-whisper
     runs-on: ubuntu-latest
     timeout-minutes: 90   # QEMU emulation of whisper.load_model() can be slow on cold cache
 
