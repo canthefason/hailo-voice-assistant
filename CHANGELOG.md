@@ -10,6 +10,25 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.10] — 2026-05-03
+
+### Added
+- `wyoming_hailo_whisper`: post-transcription correction map (`_CORRECTIONS`) that fixes common Whisper Small misrecognitions before the transcript is sent to Home Assistant. Current corrections: "leaving room" / "living rome" / "living rum" → "living room"; "turn of" → "turn off". Corrections are word-boundary regex patterns applied in order after each inference; they do not affect transcription latency.
+- `wyoming_hailo_whisper`: raw-transcript logging with per-utterance HA success/failure. When `WHISPER_RAW_LOG` is set, every utterance is appended to a TSV file (`timestamp\traw\tcorrected\tresponse_type\tdetail`). The HA `/api/conversation/process` call is made in a background asyncio task so it never adds latency to the voice pipeline. Requires `HA_TOKEN` env var; `HA_URL` defaults to `http://host.docker.internal:8123`. Example volume mount and env vars are commented out in `docker-compose.voice-assistant.yml`.
+- `wyoming_hailo_whisper/test_whisper.py`: 29 unit tests covering `_apply_corrections`, `HailoWhisperCore.transcribe`, `_write_log_line`, `_call_ha_conversation`, and `_log_with_ha_result`. All `hailo_platform` and `wyoming.*` dependencies are stubbed via `sys.modules.setdefault` so tests run locally and in CI without NPU hardware.
+- `hailo_ollama_proxy/test_proxy.py`: 108 unit tests for the OpenAI-compat proxy, gated in CI via a `test-proxy` job that must pass before the `hailo-ollama` Docker image is built.
+- CI: `test-whisper` job added to `build-and-push.yml`. Runs `wyoming_hailo_whisper/test_whisper.py` on every push/PR that touches `wyoming_hailo_whisper/**`; the `build` (hailo-whisper Docker image) job now depends on it passing.
+- `docker-compose.voice-assistant.yml`: `extra_hosts: host.docker.internal:host-gateway` always present in `hailo-whisper` service (needed for container→HA networking); commented-out `WHISPER_RAW_LOG` / `HA_URL` / `HA_TOKEN` env vars and log volume mount to show how to enable transcript logging.
+- `docs/`: README files updated with intent configuration examples.
+
+### Changed
+- `HailoWhisperCore.transcribe` now returns `(raw, corrected)` tuple instead of a plain `str`. Callers (handler) receive both so the uncorrected Whisper output can be logged alongside the corrected version sent to HA.
+
+### Removed
+- `compose.yaml` removed from repo root (was a stale local-only file; the canonical compose lives on the Pi at `/home/ctf/homeassistant/compose.yaml`).
+
+---
+
 ## [1.0.9] — 2026-05-02
 
 ### Added
