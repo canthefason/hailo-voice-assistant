@@ -63,6 +63,16 @@ services:
       - HAILO_OLLAMA_VDEVICE_GROUP_ID=SHARED
       - PYTHONPATH=/usr/lib/python3/dist-packages
       - LD_LIBRARY_PATH=/usr/lib
+      # Optional: write raw Whisper transcripts + HA result to a log file.
+      # Requires the volume mount below and HA_TOKEN to be set.
+      # - WHISPER_RAW_LOG=/logs/raw_transcripts.log
+      # - HA_URL=http://host.docker.internal:8123
+      # - HA_TOKEN=<your_long_lived_ha_token>
+    extra_hosts:
+      # Required for WHISPER_RAW_LOG / HA result logging so the container can
+      # reach Home Assistant on the host network. Safe to keep even if logging
+      # is disabled.
+      - "host.docker.internal:host-gateway"
     volumes:
       # Hailo Python bindings — mounted from host.
       # Path depends on which Python was used during HailoRT install.
@@ -70,6 +80,9 @@ services:
       - /usr/local/lib/python3.13/dist-packages/hailo_platform:/usr/lib/python3/dist-packages/hailo_platform:ro
       # Native HailoRT library — adjust version suffix to match your install.
       - /usr/lib/libhailort.so.5.3.0:/usr/lib/libhailort.so.5.3.0:ro
+      # Optional: writable directory for the raw transcript log.
+      # Create it first: mkdir -p /home/ctf/homeassistant/whisper-logs
+      # - /home/ctf/homeassistant/whisper-logs:/logs
 
   # ── Text-to-Speech / Wyoming (CPU) ─────────────────────────────────────────
   piper:
