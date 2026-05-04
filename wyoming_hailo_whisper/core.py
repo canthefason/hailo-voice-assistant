@@ -18,6 +18,7 @@ Performance note:
   on every utterance — the dominant latency source.
 """
 import logging
+import re
 import numpy as np
 from pathlib import Path
 
@@ -28,6 +29,21 @@ _LOGGER = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16_000
 SHARED_VDEVICE_GROUP_ID = "SHARED"
+
+# Known Whisper Small misrecognitions for this vocabulary.
+# Each tuple is (compiled pattern, replacement). Applied in order after transcription.
+_CORRECTIONS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bleaving room\b", re.IGNORECASE), "living room"),
+    (re.compile(r"\bliving rome\b", re.IGNORECASE), "living room"),
+    (re.compile(r"\bliving rum\b", re.IGNORECASE), "living room"),
+    (re.compile(r"\bturn of\b(?!\s*f)", re.IGNORECASE), "turn off"),
+]
+
+
+def _apply_corrections(text: str) -> str:
+    for pattern, replacement in _CORRECTIONS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 class HailoWhisperCore:
@@ -86,13 +102,13 @@ class HailoWhisperCore:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def transcribe(self, audio_bytes: bytes) -> str:
+    def transcribe(self, audio_bytes: bytes) -> tuple[str, str]:
         """
         Transcribe raw PCM-16 (16 kHz, mono) bytes to text.
-        Returns stripped transcript string.
+        Returns (raw, corrected) where raw is the unmodified Whisper output.
         """
         if not audio_bytes:
-            return ""
+            return "", ""
 
         # Convert PCM-16 → float32 in [-1, 1], little-endian (required by genai API)
         audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
@@ -106,6 +122,9 @@ class HailoWhisperCore:
             timeout_ms=30000,
         )
 
-        text = "".join(seg.text for seg in segments).strip()
-        _LOGGER.debug("Transcript: %r", text)
-        return text
+        raw = "".join(seg.text for seg in segments).strip()
+        corrected = _apply_corrections(raw)
+        _LOGGER.info("WHISPER_RAW: %s", raw)
+        if corrected != raw:
+            _LOGGER.info("WHISPER_CORRECTED: %s", corrected)
+        return raw, corrected
